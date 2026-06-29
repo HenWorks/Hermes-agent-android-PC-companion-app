@@ -1,9 +1,9 @@
 """
-plugin serve 測試 — 需 PyNaCl+zeroconf，用 venv 跑：
+plugin serve tests — requires PyNaCl+zeroconf, run with a venv:
     /tmp/handoff-venv/bin/python handoff/tests/test_plugin_serve.py
 
-驗證 plugin 入口 serve() 正確接線（identity/peers/export_fn 綁 ~/.hermes）+ pairing_qr()，
-並用 client 端到端拉取一則對話。
+Verifies that the plugin entry point serve() wires things up correctly (identity/peers/export_fn
+bound to ~/.hermes) + pairing_qr(), and pulls one conversation end-to-end with the client.
 """
 import os
 import sqlite3
@@ -13,7 +13,7 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
-import handoff            # package（其 __init__ 會把 handoff/ 加入 sys.path）  # noqa: E402
+import handoff            # package (its __init__ adds handoff/ to sys.path)  # noqa: E402
 import handoff_server as hs  # noqa: E402
 import handoff_core as hc    # noqa: E402
 import pairing as pr         # noqa: E402
@@ -48,24 +48,24 @@ def run():
     md = os.path.join(home, "memories"); os.makedirs(md)
     open(os.path.join(md, "MEMORY.md"), "w").write("- m1\n")
 
-    # plugin serve()（advertise=False 求測試確定性）
+    # plugin serve() (advertise=False for test determinism)
     srv = handoff.serve(home, advertise=False)
     try:
-        # serve 應在 ~/.hermes/handoff/ 建好身分 + peers
+        # serve should create the identity + peers under ~/.hermes/handoff/
         assert os.path.isfile(os.path.join(home, "handoff", "id.key"))
-        # pairing_qr 可解析、device_id 與 server 一致
+        # pairing_qr is parseable, device_id matches the server
         peer = pr.parse_pair_qr(handoff.pairing_qr(srv))
         assert peer.device_id == srv.identity.device_id
         assert peer.public_key == bytes(srv.identity.public_key)
 
-        # 配對一台手機 + 端到端拉取
+        # pair a phone + end-to-end pull
         phone = pr.load_or_create_identity(os.path.join(home, "phone.key"))
         srv.peers.add(phone.device_id, bytes(phone.public_key))
         bundle = hs.pull_session("127.0.0.1", srv.port, phone,
                                  bytes(srv.identity.public_key), "SID")
         assert bundle["session_ids"] == ["SID"]
-        assert bundle["memory"] == {"MEMORY.md": "- m1\n"}, "serve 應帶 memory"
-        # import 驗
+        assert bundle["memory"] == {"MEMORY.md": "- m1\n"}, "serve should carry memory"
+        # verify import
         phone_db = os.path.join(home, "phone_state.db")
         pc = sqlite3.connect(phone_db); pc.executescript(_DDL)
         pc.execute("DELETE FROM sessions"); pc.execute("DELETE FROM messages")
@@ -75,7 +75,7 @@ def run():
     finally:
         srv.stop()
 
-    print("✅ 全部通過：serve 接線(identity/peers/export_fn+memory) · pairing_qr · 端到端拉取+import")
+    print("✅ all passed: serve wiring(identity/peers/export_fn+memory) · pairing_qr · end-to-end pull+import")
     return 0
 
 

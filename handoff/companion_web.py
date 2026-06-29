@@ -1,11 +1,13 @@
 """
-companion_web — 桌面瀏覽器本地控制台（標準庫 http.server，零外加相依）。
+companion_web — local desktop browser console (standard-library http.server, zero extra dependencies).
 
-北極星：PC 端零終端。用戶（裝了 hermes 後）開瀏覽器即見配對 QR + 連線狀態 + 任務歷史，
-手機掃碼就連上——不必看終端、不必裝 uv、不必下載 app。瀏覽器是每台 PC 都有的。
+North star: zero terminal on the PC side. After installing hermes, the user opens a browser and
+immediately sees the pairing QR + connection status + task history; scanning with the phone connects —
+no terminal, no uv, no app download required. Every PC already has a browser.
 
-🔴 安全：web UI 綁 127.0.0.1（只給本機瀏覽器）；broker 的加密 TCP（手機連）是另一個 port。
-   控制台不顯示任何憑證；QR 只含公開的配對資訊（pubkey/host/port），私鑰永不離機。
+Security: the web UI binds to 127.0.0.1 (local browser only); the broker's encrypted TCP (the phone
+connection) is a separate port. The console displays no credentials; the QR only contains public
+pairing info (pubkey/host/port), and the private key never leaves the machine.
 """
 from __future__ import annotations
 
@@ -20,18 +22,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def _qr_data_uri(text: str) -> str:
-    """把字串編成 QR PNG 的 data URI（給 <img src>）。無 qrcode/pillow 則回空字串。"""
+    """Encode a string into a QR PNG data URI (for <img src>). Returns an empty string if qrcode/pillow is unavailable."""
     try:
         import qrcode
         buf = io.BytesIO()
         qrcode.make(text).save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    except Exception:  # noqa: BLE001 — QR 是輔助；產不出來頁面仍可用（顯示文字配對碼）
+    except Exception:  # noqa: BLE001 — the QR is auxiliary; if it can't be produced the page still works (shows the text pairing code)
         return ""
 
 
 def _read_history(db_path: str, limit: int = 20):
-    """唯讀連線讀最近 tasks + results（WAL 下與 broker 寫並行安全；每次查詢開後即關）。"""
+    """Read recent tasks + results over a read-only connection (safe to run concurrently with broker writes under WAL; open per query and close immediately)."""
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:
@@ -42,7 +44,7 @@ def _read_history(db_path: str, limit: int = 20):
                  for r in conn.execute(
                      "SELECT id, from_did, prompt, status, created FROM tasks "
                      "ORDER BY created DESC LIMIT ?", (limit,))]
-        # 結果全文（截 8000 字防極端長撐爆頁面）；ref 關聯回 task.id
+        # Full result text (truncated to 8000 chars to keep an extremely long one from blowing up the page); ref links back to task.id
         results = [{"ref": r[0], "ok": bool(r[1]), "text": r[2][:8000], "created": r[3]}
                    for r in conn.execute(
                        "SELECT ref, ok, text, created FROM results "
@@ -55,9 +57,9 @@ def _read_history(db_path: str, limit: int = 20):
 
 
 class _Handler(BaseHTTPRequestHandler):
-    broker = None  # 由 partial 注入
+    broker = None  # injected via partial
 
-    def log_message(self, *a):  # noqa: A002 — 靜音 access log
+    def log_message(self, *a):  # noqa: A002 — silence the access log
         pass
 
     def _send(self, code: int, ctype: str, body: bytes):
@@ -67,14 +69,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):  # noqa: N802 — http.server 介面
+    def do_GET(self):  # noqa: N802 — http.server interface
         if self.path == "/" or self.path.startswith("/index"):
             self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
         elif self.path.startswith("/api/status"):
             body = json.dumps(self._status(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif self.path.startswith("/api/open-pairing"):
-            self.broker.open_pairing(300)  # GUI 一鍵重開配對視窗（換裝置 / 過期時用）
+            self.broker.open_pairing(300)  # one-click reopen of the pairing window from the GUI (for switching devices / after expiry)
             self._send(200, "application/json; charset=utf-8", b'{"ok":true}')
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
@@ -84,13 +86,13 @@ class _Handler(BaseHTTPRequestHandler):
         pairing_left = max(0, int(b._pairing_until - time.time()))
         paired = list(b.peers._peers.keys())
         tasks, results = _read_history(b.store.path)
-        # 把結果全文（hermes 的回答）關聯到對應任務 → 控制台點任務即看完整對話
+        # Associate the full result text (hermes's answer) with its task → clicking a task in the console shows the full conversation
         by_ref = {r["ref"]: r for r in results}
         for t in tasks:
             r = by_ref.get(t["id"])
             t["result"] = r["text"] if r else None
             t["result_ok"] = r["ok"] if r else None
-            t["id"] = t["id"][:8]  # 顯示用短 id（關聯已完成）
+            t["id"] = t["id"][:8]  # short id for display (association already done)
         return {
             "bind": f"{b.host}:{b.port}",
             "device_id": b.identity.device_id,
@@ -104,10 +106,10 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def serve_web(broker, host: str = "127.0.0.1", port: int = 0):
-    """啟動本地控制台 web server（daemon thread）。回 (host, port)。綁 127.0.0.1 只給本機瀏覽器。"""
+    """Start the local console web server (daemon thread). Returns (host, port). Binds to 127.0.0.1 for the local browser only."""
     handler = partial(_Handler)
     handler.broker = broker  # type: ignore[attr-defined]
-    # partial 無法設類別屬性 → 直接設在 _Handler 上（單一 broker 程序，足夠）
+    # partial can't set class attributes → set it directly on _Handler (a single broker process, which is enough)
     _Handler.broker = broker
     httpd = ThreadingHTTPServer((host, port), _Handler)
     actual_port = httpd.server_address[1]
@@ -261,7 +263,7 @@ async function tick(){
     document.getElementById('window').textContent = s.pairing_left ? T.win_open(s.pairing_left) : T.win_closed;
     document.getElementById('qrbox').innerHTML = s.qr ? '<img src="'+s.qr+'" alt="QR">' : '<div class="empty">'+T.qr_fail+'</div>';
     const tj = JSON.stringify(s.tasks);
-    if(tj !== lastTasksJson){ lastTasksJson = tj; renderTasks(s.tasks); }  // 只在變化時重繪，保住展開狀態
+    if(tj !== lastTasksJson){ lastTasksJson = tj; renderTasks(s.tasks); }  // only re-render on change, to preserve expanded state
   }catch(e){ document.getElementById('dot').className='dot off'; }
 }
 tick(); setInterval(tick, 3000);

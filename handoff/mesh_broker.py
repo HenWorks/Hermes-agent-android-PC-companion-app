@@ -1,25 +1,28 @@
 """
-mesh_broker — 桌面側 mesh broker + worker（LAN-first，M1+M2）。
+mesh_broker — desktop-side mesh broker + worker (LAN-first, M1+M2).
 
-定位（見 android/docs/mesh-design.md）：讓手機 app 把任務非同步派給桌面 hermes 執行、收回結果。
-M2 單機情境：**broker 就是 worker 節點本身**——手機↔桌面直接 e2e（broker 即收件人，不中繼解密）。
-多節點中繼（broker 轉發給其他 worker、不解密）是未來事，本檔不做。
+Purpose (see android/docs/mesh-design.md): let the phone app dispatch tasks asynchronously
+to the desktop hermes to run, then collect the results.
+M2 single-machine case: **the broker IS the worker node itself** — phone↔desktop direct e2e
+(the broker is the recipient, it does not relay-decrypt).
+Multi-node relay (broker forwards to other workers without decrypting) is future work, not done here.
 
-複用 handoff 底座（零重造）：
-- pairing.py：DeviceIdentity / load_or_create_identity / box_encrypt|decrypt / build_pair_qr
-- handoff_server.py：PeerStore（配對信任）/ _send_frame|_recv_frame（4-byte framing）/ _local_ip
+Reuses the handoff foundation (zero rebuild):
+- pairing.py: DeviceIdentity / load_or_create_identity / box_encrypt|decrypt / build_pair_qr
+- handoff_server.py: PeerStore (pairing trust) / _send_frame|_recv_frame (4-byte framing) / _local_ip
 
-協定（每連線一個 op，沿用 handoff 握手+認證模式）：
-  1. client 明文送 {did, pk}（hello）
-  2. broker 查 is_paired → {ok, proto} 或 {ok:false, err}
-  3. client 送 Box(client_sk→broker_pk)(請求 JSON)，op 之一：
-       push  {op:"push", task:{id,prompt,created_at}}  → 入工作佇列；回 {ok, id}
-       poll  {op:"poll"}                                → 回 Box(broker_sk→client_pk)({ok, results:[...]})
-       ack   {op:"ack", ids:[...]}                      → 刪已收結果；回 {ok}
-  worker 執行緒：取 pending task → 跑 `hermes -z <prompt>` oneshot → 結果寫 outbox（to=發起者 did）。
+Protocol (one op per connection, following the handoff handshake+auth model):
+  1. client sends {did, pk} in plaintext (hello)
+  2. broker checks is_paired → {ok, proto} or {ok:false, err}
+  3. client sends Box(client_sk→broker_pk)(request JSON), one of these ops:
+       push  {op:"push", task:{id,prompt,created_at}}  → enqueue work; reply {ok, id}
+       poll  {op:"poll"}                                → reply Box(broker_sk→client_pk)({ok, results:[...]})
+       ack   {op:"ack", ids:[...]}                      → delete received results; reply {ok}
+  worker thread: take a pending task → run `hermes -z <prompt>` oneshot → write result to outbox (to=originator did).
 
-🔴 安全：broker 預設綁 LAN IP（非 0.0.0.0）；只接受已配對 node 公鑰；payload NaCl e2e；
-   payload 絕不含憑證（只傳任務 prompt 與結果文字）。私鑰永不離機。
+🔴 Security: the broker binds to a LAN IP by default (not 0.0.0.0); only accepts public keys of
+   paired nodes; payload is NaCl e2e; the payload never contains credentials (only the task prompt
+   and result text). The private key never leaves the machine.
 """
 from __future__ import annotations
 
@@ -37,30 +40,33 @@ from typing import Optional
 
 import pairing as pr
 import handoff_server as hs
-import desktop_export as de   # 接力（handoff）：把 session 匯出成可加密傳輸的 bundle
-import handoff_core as hc      # 反向同步（#22）：手機上傳 bundle → import_all 冪等合併進 PC
+import desktop_export as de   # handoff: export a session into an encryptable transport bundle
+import handoff_core as hc      # reverse sync (#22): phone uploads bundle → import_all idempotently merges into PC
 
 SERVICE_TYPE = "_hermes-mesh._tcp.local."
 PROTO = 1
-MAX_RESULT_CHARS = 64 * 1024  # 單一結果上限，避免異常長輸出撐爆通知/傳輸
-# 手機派工的對話會以此前綴開頭，讓桌面 hermes（sessions list / browse / resume）一眼認出來源。
-# 純 prompt 字串，照常呼叫 `hermes -z`——不碰上游套件、不改 state.db schema，上游更新不受影響。
-MESH_TASK_MARKER = "📱 [手機派工] "
-# 固定預設 port（⚠️ 必須固定，不可隨機）：手機 app 配對後把 host:port 存進 peer，之後一直用它連。
-# 若 broker 每次重啟換 port，手機就連不到（顯示離線、派工失敗）。51379 為避開常用服務的高位埠。
+MAX_RESULT_CHARS = 64 * 1024  # per-result cap, to avoid an abnormally long output blowing up notification/transport
+# Phone-dispatched conversations start with this prefix, so the desktop hermes (sessions list /
+# browse / resume) can recognize the source at a glance.
+# It's a plain prompt string, called via `hermes -z` as usual — it doesn't touch upstream packages
+# or change the state.db schema, so upstream updates are unaffected.
+MESH_TASK_MARKER = "📱 [Phone dispatch] "
+# Fixed default port (⚠️ must be fixed, not random): after pairing, the phone app stores host:port
+# in the peer and keeps connecting with it. If the broker picks a new port on every restart, the
+# phone can't reach it (shows offline, dispatch fails). 51379 is a high port that avoids common services.
 DEFAULT_PORT = 51379
 
 
-# ── 佇列儲存（SQLite，個人規模足夠）─────────────────────────────────────────
+# ── Queue store (SQLite, enough for personal scale) ─────────────────────────────
 
 class MeshStore:
-    """tasks（待跑）+ results（待手機收）。單檔 SQLite，broker 與 worker 共用。"""
+    """tasks (pending to run) + results (pending phone pickup). Single-file SQLite, shared by broker and worker."""
 
     def __init__(self, path: str):
         self.path = path
         d = os.path.dirname(os.path.abspath(path)) or "."
         os.makedirs(d, exist_ok=True)
-        # check_same_thread=False：broker 連線執行緒與 worker 執行緒共用；用 _lock 串行化
+        # check_same_thread=False: shared by the broker connection threads and the worker thread; serialized via _lock
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._lock = threading.Lock()
@@ -77,7 +83,8 @@ class MeshStore:
                 "id TEXT PRIMARY KEY, ref TEXT NOT NULL, to_did TEXT NOT NULL,"
                 "ok INTEGER NOT NULL, text TEXT NOT NULL, created REAL NOT NULL,"
                 "delivered INTEGER NOT NULL DEFAULT 0)")
-        # migration：舊 db 補 delivered 欄（已存在則忽略）→ ack 改標記送達、不刪，結果可在控制台留存
+        # migration: add the delivered column to old dbs (ignore if it already exists) → ack now marks as
+        # delivered instead of deleting, so results can be retained in the console
         with self._lock:
             try:
                 with self._db:
@@ -93,7 +100,7 @@ class MeshStore:
                 "VALUES(?,?,?,'pending',?)", (task_id, from_did, prompt, time.time()))
 
     def claim_next_task(self) -> Optional[dict]:
-        """原子取一個 pending → 標 running，回 {id, from_did, prompt}。無則 None。"""
+        """Atomically take one pending task → mark running, return {id, from_did, prompt}. None if none."""
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT id, from_did, prompt FROM tasks WHERE status='pending' "
@@ -108,8 +115,8 @@ class MeshStore:
             self._db.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
 
     def requeue_running(self) -> int:
-        """啟動時把卡在 'running' 的任務還原為 'pending'（broker 中途重啟的崩潰復原，
-        at-least-once）。回重新排入的筆數。"""
+        """On startup, restore tasks stuck in 'running' back to 'pending' (crash recovery for a
+        mid-flight broker restart, at-least-once). Returns the number of tasks re-enqueued."""
         with self._lock, self._db:
             cur = self._db.execute("UPDATE tasks SET status='pending' WHERE status='running'")
             return cur.rowcount
@@ -121,7 +128,7 @@ class MeshStore:
                 (uuid.uuid4().hex, ref, to_did, 1 if ok else 0, text[:MAX_RESULT_CHARS], time.time()))
 
     def pending_results(self, to_did: str) -> list[dict]:
-        """手機待收的結果：只回尚未送達（delivered=0）的，避免重複通知。"""
+        """Results pending phone pickup: return only not-yet-delivered (delivered=0) ones, to avoid duplicate notifications."""
         with self._lock, self._db:
             rows = self._db.execute(
                 "SELECT id, ref, ok, text, created FROM results "
@@ -130,8 +137,9 @@ class MeshStore:
                 for r in rows]
 
     def mark_delivered(self, ids: list[str], to_did: str) -> None:
-        """標記結果為已送達（不刪除，保留供桌面控制台檢視），**綁定擁有者 to_did**：
-        一個已配對 node 不能 ack/標記別人的結果。poll 之後就不再回這些 → 不重複通知。"""
+        """Mark results as delivered (don't delete; keep them for desktop console viewing), **bound to
+        owner to_did**: a paired node cannot ack/mark someone else's results. After poll these are no
+        longer returned → no duplicate notifications."""
         if not ids:
             return
         with self._lock, self._db:
@@ -146,27 +154,27 @@ class MeshBroker:
     identity: pr.DeviceIdentity
     peers: hs.PeerStore
     store: MeshStore
-    # 跑任務的指令；{prompt} 由 worker 以參數帶入（不做 shell 字串拼接，防注入）
+    # command to run a task; {prompt} is passed by the worker as an argument (no shell string concatenation, injection-safe)
     hermes_cmd: list[str] = field(default_factory=lambda: ["hermes", "-z"])
     home: Optional[str] = None
-    host: str = ""          # 預設綁 LAN IP（見 start）；絕不 0.0.0.0
-    port: int = 0           # 0 = 自動選
+    host: str = ""          # binds to a LAN IP by default (see start); never 0.0.0.0
+    port: int = 0           # 0 = auto-select
 
     _sock: Optional[socket.socket] = None
     _running: bool = False
     _zc = None
     _zc_info = None
-    _pairing_until: float = 0.0   # 配對視窗到期時間戳（time.time()）；之前為未開放
+    _pairing_until: float = 0.0   # pairing-window expiry timestamp (time.time()); before this, not open
 
-    # ---- 配對視窗 ----
+    # ---- pairing window ----
     def open_pairing(self, window_sec: int = 300) -> None:
-        """開放時限配對視窗：期間內未配對 node 可用 pair op 加入信任。"""
+        """Open a time-limited pairing window: during it, an unpaired node may use the pair op to join trust."""
         self._pairing_until = time.time() + window_sec
 
     def _pairing_open(self) -> bool:
         return time.time() < self._pairing_until
 
-    # ---- 連線處理（每連線一個 op）----
+    # ---- connection handling (one op per connection) ----
     def _handle(self, conn: socket.socket):
         try:
             _peer = conn.getpeername()[0] if conn.fileno() != -1 else "?"
@@ -176,23 +184,24 @@ class MeshBroker:
             hello = json.loads(hs._recv_frame(conn).decode("utf-8"))
             cdid, cpk = hello["did"], pr._b64d(hello["pk"])
             paired = self.peers.is_paired(cdid, cpk)
-            # 未配對：只有在配對視窗內才允許繼續（為了走 pair op）；否則拒絕。
+            # Unpaired: only allowed to continue while the pairing window is open (to run the pair op); otherwise reject.
             if not paired and not self._pairing_open():
-                print(f"[mesh] ✗ 拒絕 {_peer} did={cdid[:8]}：未配對且配對視窗已關", flush=True)
+                print(f"[mesh] ✗ rejected {_peer} did={cdid[:8]}: not paired and pairing window closed", flush=True)
                 hs._send_frame(conn, json.dumps({"ok": False, "err": "not paired"}).encode())
                 return
             hs._send_frame(conn, json.dumps({"ok": True, "proto": PROTO, "paired": paired}).encode())
 
-            # 加密請求：box_decrypt(broker_sk, cpk) 成功 = 對方持有 cpk 對應私鑰（認證該公鑰）
-            # 且加密給 broker_pk（證明掃過 QR 拿到 broker 公鑰）。pair 即靠這兩點 + 時限窗建立信任。
+            # Encrypted request: a successful box_decrypt(broker_sk, cpk) means the peer holds the private
+            # key for cpk (authenticating that public key) and encrypted to broker_pk (proving it scanned
+            # the QR to obtain the broker public key). pair establishes trust on these two points + the time window.
             req = json.loads(pr.box_decrypt(self.identity.private_key, cpk, hs._recv_frame(conn)))
             op = req.get("op")
-            if op != "poll":  # poll 每數秒一次太頻繁，不印避免洗版；其餘 op 留診斷軌跡
+            if op != "poll":  # poll runs every few seconds, too frequent — don't print to avoid spam; keep a diagnostic trail for other ops
                 print(f"[mesh] ← {_peer} did={cdid[:8]} op={op} paired={paired}", flush=True)
             if op == "pair":
                 self._op_pair(conn, cdid, cpk)
                 return
-            # 其餘 op 一律要求已配對（配對視窗不等於可派工）
+            # all other ops require being paired (an open pairing window does not mean dispatch is allowed)
             if not paired:
                 hs._send_frame(conn, json.dumps({"ok": False, "err": "not paired"}).encode())
                 return
@@ -201,16 +210,16 @@ class MeshBroker:
             elif op == "poll":
                 self._op_poll(conn, cpk, cdid)
             elif op == "ack":
-                self.store.mark_delivered(list(req.get("ids", [])), cdid)  # 標記送達(不刪)、綁認證身分
+                self.store.mark_delivered(list(req.get("ids", [])), cdid)  # mark delivered (don't delete), bound to authenticated identity
                 hs._send_frame(conn, json.dumps({"ok": True}).encode())
             elif op == "pull":
-                self._op_pull(conn, cpk, req)   # 接力：匯出指定 session bundle、加密回傳
+                self._op_pull(conn, cpk, req)   # handoff: export the specified session bundle, encrypt and return
             elif op == "push_session":
-                self._op_push_session(conn, req)  # 反向同步：手機上傳 bundle、冪等合併進 PC
+                self._op_push_session(conn, req)  # reverse sync: phone uploads bundle, idempotently merge into PC
             else:
                 hs._send_frame(conn, json.dumps({"ok": False, "err": f"bad op: {op}"}).encode())
-        except Exception as e:  # noqa: BLE001 — 單連線錯誤不拖垮 broker
-            print(f"[mesh] ✗ 連線 {_peer} 處理錯誤：{type(e).__name__}: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001 — a single-connection error must not take down the broker
+            print(f"[mesh] ✗ connection {_peer} handling error: {type(e).__name__}: {e}", flush=True)
             try:
                 hs._send_frame(conn, json.dumps({"ok": False, "err": str(e)}).encode())
             except OSError:
@@ -219,8 +228,9 @@ class MeshBroker:
             conn.close()
 
     def _op_pair(self, conn, cdid: str, cpk: bytes):
-        """把手機公鑰加入信任（反向配對）。已配對 → idempotent 放行（重掃接力 QR 不該因配對
-        視窗過期而失敗）；未配對則須在時限視窗內，窗外拒絕。"""
+        """Add the phone's public key to trust (reverse pairing). Already paired → idempotent pass-through
+        (re-scanning the handoff QR shouldn't fail just because the pairing window expired); if unpaired,
+        it must be within the time-limited window, rejected outside it."""
         if self.peers.is_paired(cdid, cpk):
             hs._send_frame(conn, json.dumps({"ok": True, "did": self.identity.device_id}).encode())
             return
@@ -243,15 +253,16 @@ class MeshBroker:
     def _op_poll(self, conn, cpk: bytes, cdid: str):
         results = self.store.pending_results(cdid)
         payload = json.dumps({"ok": True, "results": results}, ensure_ascii=False).encode("utf-8")
-        # 結果經 Box(broker_sk→client_pk) 加密 → 只有該手機能解 + 驗來源
+        # results are encrypted via Box(broker_sk→client_pk) → only that phone can decrypt + verify the source
         hs._send_frame(conn, pr.box_encrypt(self.identity.private_key, cpk, payload))
 
     def _op_pull(self, conn, cpk: bytes, req: dict):
-        """接力 op：把指定 session 的 bundle 加密回傳給已配對手機（複用桌面匯出）。
+        """handoff op: encrypt and return the specified session's bundle to the paired phone (reusing desktop export).
 
-        與協作（push/poll/ack）共用同一信任域、同一連線協定 → 一個 server、一次配對同時
-        支援接力 + 協作。機密永不入 bundle（desktop_export 只讀 state.db + memories/，
-        絕不碰 auth.json/.env）。回應協定：{ok} frame + Box(bundle) frame（對齊手機端 pull）。"""
+        Shares the same trust domain and connection protocol as collaboration (push/poll/ack) → one server,
+        one pairing supports both handoff and collaboration. Secrets never enter the bundle (desktop_export
+        only reads state.db + memories/, never touches auth.json/.env). Response protocol: {ok} frame +
+        Box(bundle) frame (aligned with the phone-side pull)."""
         session_id = req.get("session_id")
         if not session_id:
             hs._send_frame(conn, json.dumps({"ok": False, "err": "no session_id"}).encode())
@@ -260,7 +271,7 @@ class MeshBroker:
         try:
             bundle = de.export_for_handoff(home, session_id,
                                            source_device=self.identity.device_id)
-        except Exception as e:  # noqa: BLE001 — 匯出失敗（找不到 db / schema 過舊）誠實回報
+        except Exception as e:  # noqa: BLE001 — export failure (db not found / schema too old) reported honestly
             hs._send_frame(conn, json.dumps({"ok": False, "err": str(e)}).encode())
             return
         if bundle is None:
@@ -268,15 +279,17 @@ class MeshBroker:
             return
         payload = json.dumps(bundle, ensure_ascii=False).encode("utf-8")
         hs._send_frame(conn, json.dumps({"ok": True}).encode())
-        # bundle 經 Box(broker_sk→client_pk) 加密 → 只有該手機能解 + 驗來源
+        # the bundle is encrypted via Box(broker_sk→client_pk) → only that phone can decrypt + verify the source
         hs._send_frame(conn, pr.box_encrypt(self.identity.private_key, cpk, payload))
 
     def _op_push_session(self, conn, req: dict):
-        """反向同步 op（#22）：手機上傳本機全部對話 bundle → 以 import_all 冪等合併進 PC
-        state.db + memories（by-id upsert + 訊息自然鍵去重 + memory append-union）。
+        """reverse sync op (#22): the phone uploads bundles of all its local conversations → idempotently
+        merge into PC state.db + memories via import_all (by-id upsert + message natural-key dedup +
+        memory append-union).
 
-        bundle 已在加密 req 內（box_decrypt 已解，全程密文）。回 {ok, stats}（與接力匯入同統計）。
-        機密永不被影響：import 只寫 state.db + memories/，不碰 auth.json/.env。"""
+        The bundle is already inside the encrypted req (box_decrypt has decoded it, encrypted end-to-end).
+        Returns {ok, stats} (same stats as handoff import). Secrets are never affected: import only writes
+        state.db + memories/, never touches auth.json/.env."""
         bundle = req.get("bundle")
         if not isinstance(bundle, dict):
             hs._send_frame(conn, json.dumps({"ok": False, "err": "no bundle"}).encode())
@@ -284,28 +297,28 @@ class MeshBroker:
         home = self.home or os.path.expanduser("~/.hermes")
         try:
             stats = hc.import_all(home, bundle)
-        except Exception as e:  # noqa: BLE001 — 匯入失敗（schema 不符 / db 鎖）誠實回報
+        except Exception as e:  # noqa: BLE001 — import failure (schema mismatch / db locked) reported honestly
             hs._send_frame(conn, json.dumps({"ok": False, "err": str(e)}).encode())
             return
         hs._send_frame(conn, json.dumps({"ok": True, "stats": stats}, ensure_ascii=False).encode())
 
-    # ---- worker：跑 hermes oneshot ----
+    # ---- worker: run hermes oneshot ----
     def _worker_loop(self):
         while self._running:
             task = self.store.claim_next_task()
             if task is None:
                 time.sleep(1.0)
                 continue
-            print(f"[mesh] ▶ 收到任務 {task['id'][:8]} from={task['from_did'][:8]}: "
-                  f"{task['prompt'][:80]}  → 執行 {' '.join(self.hermes_cmd)} …", flush=True)
+            print(f"[mesh] ▶ received task {task['id'][:8]} from={task['from_did'][:8]}: "
+                  f"{task['prompt'][:80]}  → running {' '.join(self.hermes_cmd)} …", flush=True)
             t0 = time.time()
-            # 加可辨識前綴 → 桌面 session 歷史一眼看出是手機派的；獨立 session、彼此不共享上下文。
+            # add an identifiable prefix → the desktop session history shows at a glance it's phone-dispatched; an independent session, no shared context.
             ok, text = self._run_hermes(MESH_TASK_MARKER + task["prompt"])
-            print(f"[mesh] {'✓' if ok else '✗'} 任務 {task['id'][:8]} 完成（{time.time()-t0:.1f}s）"
-                  f"：{text[:100].replace(chr(10), ' ')}", flush=True)
+            print(f"[mesh] {'✓' if ok else '✗'} task {task['id'][:8]} done ({time.time()-t0:.1f}s)"
+                  f": {text[:100].replace(chr(10), ' ')}", flush=True)
             self.store.add_result(task["id"], task["from_did"], ok, text)
             self.store.finish_task(task["id"])
-            print(f"[mesh] ⇧ 結果已入手機收件匣，等手機 poll 取走", flush=True)
+            print(f"[mesh] ⇧ result placed in the phone inbox, waiting for the phone to poll it", flush=True)
 
     def _run_hermes(self, prompt: str) -> tuple[bool, str]:
         env = dict(os.environ)
@@ -314,22 +327,22 @@ class MeshBroker:
         try:
             proc = subprocess.run(
                 self.hermes_cmd + [prompt], capture_output=True, text=True,
-                env=env, timeout=900)  # 15 分鐘上限（agent 長任務）
+                env=env, timeout=900)  # 15-minute cap (long-running agent tasks)
             out = (proc.stdout or "").strip()
             if proc.returncode != 0:
                 return False, (out + "\n" + (proc.stderr or "")).strip()[:MAX_RESULT_CHARS] \
                     or f"hermes exited {proc.returncode}"
             return True, out or "(no output)"
         except FileNotFoundError:
-            return False, f"找不到 hermes 指令：{self.hermes_cmd[0]}（請確認已安裝且在 PATH）"
+            return False, f"hermes command not found: {self.hermes_cmd[0]} (ensure it's installed and on PATH)"
         except subprocess.TimeoutExpired:
-            return False, "任務逾時（>15 分鐘）"
+            return False, "task timed out (>15 minutes)"
         except Exception as e:  # noqa: BLE001
-            return False, f"執行錯誤：{e}"
+            return False, f"execution error: {e}"
 
-    # ---- 生命週期 ----
+    # ---- lifecycle ----
     def start(self, advertise: bool = True) -> int:
-        bind_host = self.host or hs._local_ip()  # LAN IP；絕不 0.0.0.0
+        bind_host = self.host or hs._local_ip()  # LAN IP; never 0.0.0.0
         self.host = bind_host
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -337,9 +350,9 @@ class MeshBroker:
         self.port = self._sock.getsockname()[1]
         self._sock.listen(8)
         self._running = True
-        requeued = self.store.requeue_running()  # 崩潰復原：把上次卡 running 的任務還原 pending
+        requeued = self.store.requeue_running()  # crash recovery: restore tasks stuck running last time back to pending
         if requeued:
-            print(f"[mesh] 重新排入 {requeued} 個上次未完成的任務")
+            print(f"[mesh] re-enqueued {requeued} unfinished task(s) from last time")
 
         def accept_loop():
             while self._running:
@@ -383,18 +396,19 @@ class MeshBroker:
                 pass
 
     def pair_qr(self) -> str:
-        """純配對 QR（給手機掃建立信任）。複用 handoff v1 schema。"""
+        """Pure pairing QR (for the phone to scan to establish trust). Reuses the handoff v1 schema."""
         return pr.build_pair_qr(self.identity, self.host, self.port)
 
     def handoff_qr(self, session_id: str) -> str:
-        """接力 QR：配對資訊 + 指定 session_id。手機首掃即配對 + 選定要接收的對話。
-        統一 server 後，接力與協作共用此身分；掃這個 QR 既建立信任、又指定接力 session。"""
+        """Handoff QR: pairing info + the specified session_id. The phone's first scan both pairs and
+        selects the conversation to receive. With the unified server, handoff and collaboration share
+        this identity; scanning this QR both establishes trust and specifies the handoff session."""
         return pr.build_handoff_qr(self.identity, self.host, self.port, session_id)
 
 
-# ── 獨立啟動（桌面一行指令）──────────────────────────────────────────────────
+# ── Standalone launch (one-line desktop command) ──────────────────────────────
 
-_MESH_SUBDIR = "mesh"  # ~/.hermes/mesh/（mesh 身分 + 配對清單，與 handoff 分開信任域）
+_MESH_SUBDIR = "mesh"  # ~/.hermes/mesh/ (mesh identity + peer list, a trust domain separate from handoff)
 
 
 def serve(home: Optional[str] = None, advertise: bool = True,
@@ -407,10 +421,10 @@ def serve(home: Optional[str] = None, advertise: bool = True,
     peers = hs.PeerStore(os.path.join(cfg, "peers.json"))
     store = MeshStore(os.path.join(cfg, "queue.db"))
     cmd = hermes_cmd or _default_hermes_cmd()
-    # host 來源優先序：參數 > MESH_HOST 環境變數 > 自動 LAN（_local_ip）。
-    # 跨網路（手機在 4G / 不同 Wi-Fi）時用 Tailscale：MESH_HOST=<你的 100.x> 或 --host。
+    # host source priority: argument > MESH_HOST env var > auto LAN (_local_ip).
+    # For cross-network (phone on 4G / a different Wi-Fi), use Tailscale: MESH_HOST=<your 100.x> or --host.
     bind_host = host or os.environ.get("MESH_HOST", "")
-    # port 固定（見 DEFAULT_PORT）：手機 peer 存的 port 要一直有效，不可隨機。
+    # the port is fixed (see DEFAULT_PORT): the port stored in the phone peer must stay valid, not random.
     bind_port = port if port is not None else int(os.environ.get("MESH_PORT", DEFAULT_PORT))
     broker = MeshBroker(identity=identity, peers=peers, store=store,
                         hermes_cmd=cmd, home=home, host=bind_host, port=bind_port)
@@ -425,50 +439,50 @@ def _default_hermes_cmd() -> list[str]:
 
 
 def add_peer_from_phone(broker: MeshBroker, phone_did: str, phone_pk_b64: str) -> None:
-    """手機掃 broker QR 後，把手機公鑰加入信任（反向配對）。
-    M1：手機端配對請求會帶自己的 did/pk；此函式供配對流程呼叫存入 PeerStore。"""
+    """After the phone scans the broker QR, add the phone's public key to trust (reverse pairing).
+    M1: the phone-side pairing request carries its own did/pk; this function is called by the pairing flow to store it in PeerStore."""
     broker.peers.add(phone_did, pr._b64d(phone_pk_b64))
 
 
 def main(argv=None) -> int:
     import argparse
     try:
-        import qrcode  # 可選：終端印 QR 圖；無則只印文字
+        import qrcode  # optional: print a QR image in the terminal; if absent, print text only
     except ImportError:
         qrcode = None
 
     ap = argparse.ArgumentParser(
         prog="hermes-companion",
-        description="hermes 桌面伴隨服務：協作派工（mesh）+ 對話接力（handoff），一個進程、一次配對")
-    ap.add_argument("--home", default=None, help="HERMES_HOME（預設 ~/.hermes）")
-    ap.add_argument("--host", default="", help="綁定/QR 位址（跨網路給 Tailscale 100.x；預設自動 LAN）")
+        description="hermes desktop companion service: collaborative dispatch (mesh) + conversation handoff, one process, one pairing")
+    ap.add_argument("--home", default=None, help="HERMES_HOME (default ~/.hermes)")
+    ap.add_argument("--host", default="", help="bind/QR address (cross-network: a Tailscale 100.x; default auto LAN)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
-                    help=f"broker 綁定 port（預設固定 {DEFAULT_PORT}；固定才能讓手機配對後一直連得到）")
+                    help=f"broker bind port (default fixed {DEFAULT_PORT}; fixed so the phone keeps reaching it after pairing)")
     ap.add_argument("--session", default=None,
-                    help="接力指定 session：印接力 QR（手機掃後配對 + 接收此對話）。省略則印純配對 QR。")
+                    help="handoff a specific session: print a handoff QR (the phone pairs + receives this conversation after scanning). Omit to print a pure pairing QR.")
     a = ap.parse_args(argv)
 
     broker = serve(a.home, host=a.host, port=a.port)
-    broker.open_pairing(300)  # 啟動即開 5 分鐘配對視窗，讓手機掃 QR 後能完成反向配對
+    broker.open_pairing(300)  # open a 5-minute pairing window at startup, so the phone can complete reverse pairing after scanning the QR
     print(f"[companion] device_id={broker.identity.device_id} bind={broker.host}:{broker.port}"
-          f"（協作 + 接力；mDNS 廣告中、worker 待命、配對視窗 5 分鐘）")
-    # 瀏覽器本地控制台（北極星：PC 零終端）——綁 127.0.0.1 只給本機瀏覽器，跨平台用 webbrowser 開。
+          f" (collaboration + handoff; mDNS advertising, worker on standby, pairing window 5 minutes)")
+    # local browser console (North Star: zero terminal on PC) — bound to 127.0.0.1 for the local browser only, opened cross-platform via webbrowser.
     try:
         from companion_web import serve_web
         web_host, web_port = serve_web(broker)
         url = f"http://{web_host}:{web_port}/"
-        print(f"控制台：{url}（正在開啟瀏覽器；手機掃頁面上的 QR 即可連結）")
+        print(f"Console: {url} (opening the browser; scan the QR on the page to connect)")
         import webbrowser
         webbrowser.open(url)
-    except Exception as e:  # noqa: BLE001 — 控制台失敗不影響 broker 本身，退回終端 QR
-        print(f"（瀏覽器控制台啟動失敗：{e}；改用下方終端 QR）")
+    except Exception as e:  # noqa: BLE001 — a console failure doesn't affect the broker itself, fall back to the terminal QR
+        print(f"(browser console failed to start: {e}; using the terminal QR below instead)")
 
-    # 終端文字 / ASCII QR（fallback：無 GUI / SSH 連線時）
+    # terminal text / ASCII QR (fallback: no GUI / over SSH)
     if a.session:
-        print(f"接力 QR（session={a.session}）：")
+        print(f"Handoff QR (session={a.session}):")
         qr = broker.handoff_qr(a.session)
     else:
-        print("配對 QR（文字；或直接用瀏覽器控制台的圖）：")
+        print("Pairing QR (text; or just use the image in the browser console):")
         qr = broker.pair_qr()
     print(qr)
     if qrcode is not None:
@@ -478,13 +492,13 @@ def main(argv=None) -> int:
             q.print_ascii(invert=True)
         except Exception:  # noqa: BLE001
             pass
-    print("companion 執行中，Ctrl+C 結束。")
+    print("companion running, Ctrl+C to quit.")
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
         broker.stop()
-        print("\n已停止。")
+        print("\nStopped.")
     return 0
 
 

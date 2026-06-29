@@ -1,25 +1,29 @@
 """
-handoff_core — hermes-agent 對話「接力」的合併核心（M1）。
+handoff_core — merge core for hermes-agent conversation "handoff" (M1).
 
-零外部相依（只用標準庫 sqlite3 / json / hashlib），讓桌面端與測試共用同一份
-經過驗證的邏輯；手機端（Kotlin）依此規格實作對等版本。
+Zero external dependencies (standard library only: sqlite3 / json / hashlib), so the
+desktop side and tests share one piece of verified logic; the mobile side (Kotlin)
+implements an equivalent version against this spec.
 
-設計依據（見 android/docs/plan-desktop-mobile-sync.md）：
-- sessions.id 是 TEXT(UUID) → 全域唯一 → 可跨裝置 upsert
-- messages.id 是 INTEGER AUTOINCREMENT → 本機、非全域 → 匯入時丟棄來源 id、
-  靠自然鍵 (session_id, timestamp, role, content) 去重做 append-union
-- 長對話會被壓縮切成 parent_session_id 鏈 → 搬一則要帶整條連通鏈
-- FTS5 由 DB trigger 自動維護 → 正常 INSERT 即可，匯入端不需手動碰索引
-- 機密（auth.json/.env）永不在 payload 內（本模組只碰 state.db 與 memories/*.md）
+Design rationale (see android/docs/plan-desktop-mobile-sync.md):
+- sessions.id is TEXT(UUID) → globally unique → cross-device upsert
+- messages.id is INTEGER AUTOINCREMENT → local, not global → drop the source id on
+  import and dedup by natural key (session_id, timestamp, role, content) for append-union
+- long conversations get compacted into a parent_session_id chain → moving one
+  conversation means carrying the whole connected chain
+- FTS5 is maintained automatically by DB triggers → a plain INSERT suffices, the
+  importer never touches the index by hand
+- secrets (auth.json/.env) are never in the payload (this module only touches
+  state.db and memories/*.md)
 
-bundle 格式（單一 session 連通鏈）：
+bundle format (single session connected chain):
 {
   "schema": 1,
   "source_device": "<id>",
   "root_session_id": "<uuid>",
-  "session_ids": ["<uuid>", ...],          # 連通鏈全部
-  "sessions": [ {col: val, ...}, ... ],     # 動態欄位（依來源 schema）
-  "messages": [ {col: val, ...}, ... ],     # 已去除來源 id
+  "session_ids": ["<uuid>", ...],          # the entire connected chain
+  "sessions": [ {col: val, ...}, ... ],     # dynamic columns (per source schema)
+  "messages": [ {col: val, ...}, ... ],     # source id already removed
   "exported_at": <float>,
 }
 """
@@ -34,12 +38,12 @@ import tempfile
 from typing import Any, Dict, List, Optional, Set
 
 SCHEMA = 1
-# messages 自然鍵欄位（跨裝置去重用；不含本機自增 id）
+# messages natural-key columns (for cross-device dedup; excludes the local autoincrement id)
 _MSG_NATURAL_KEY = ("session_id", "timestamp", "role", "content")
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    """動態讀取表的欄位名（適配不同 schema 版本，不硬編 30 個欄位）。"""
+    """Read a table's column names dynamically (adapts to different schema versions; no hardcoded 30 columns)."""
     return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
@@ -49,26 +53,27 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-# ── 連通鏈解析 ────────────────────────────────────────────────────────────
+# ── connected-chain resolution ────────────────────────────────────────────
 
 def resolve_chain(conn: sqlite3.Connection, session_id: str) -> List[str]:
-    """回傳與 session_id 連通的整條 parent/child 鏈 session id（去重、含自己）。
+    """Return the full parent/child chain of session ids connected to session_id (deduped, including itself).
 
-    壓縮把長對話切成 parent_session_id 串接的鏈；使用者眼中的「一則對話」可能是多
-    個 session row。先沿 parent 往上找到 root，再從 root 收集所有後代。
+    Compaction splits a long conversation into a chain linked by parent_session_id; what
+    the user sees as "one conversation" may be several session rows. First walk up via
+    parent to find the root, then collect all descendants from the root.
     """
-    # 1. 往上找 root
+    # 1. walk up to the root
     root = session_id
     seen_up: Set[str] = set()
     while True:
         if root in seen_up:
-            break  # 防環
+            break  # cycle guard
         seen_up.add(root)
         row = conn.execute(
             "SELECT parent_session_id FROM sessions WHERE id = ?", (root,)
         ).fetchone()
         if row is None:
-            # session 不存在；若是起點就回空，否則停在已知最上層
+            # session does not exist; return empty if it's the starting point, otherwise stop at the highest known level
             if root == session_id:
                 return []
             break
@@ -77,7 +82,7 @@ def resolve_chain(conn: sqlite3.Connection, session_id: str) -> List[str]:
             break
         root = parent
 
-    # 2. 從 root 廣度收集所有後代
+    # 2. breadth-collect all descendants from the root
     chain: List[str] = []
     seen: Set[str] = set()
     stack = [root]
@@ -94,13 +99,13 @@ def resolve_chain(conn: sqlite3.Connection, session_id: str) -> List[str]:
     return chain
 
 
-# ── 匯出 ──────────────────────────────────────────────────────────────────
+# ── export ────────────────────────────────────────────────────────────────
 
 def export_session(db_path: str, session_id: str, source_device: str = "",
                    exported_at: float = 0.0) -> Optional[Dict[str, Any]]:
-    """從 state.db 抽出一則對話（連通鏈）的 sessions + messages，組成 bundle。
+    """Extract one conversation's (connected chain) sessions + messages from state.db into a bundle.
 
-    回傳 None 表示找不到該 session。messages 已去除來源自增 id。
+    Returns None if the session is not found. messages already have the source autoincrement id removed.
     """
     conn = _connect(db_path)
     try:
@@ -108,7 +113,7 @@ def export_session(db_path: str, session_id: str, source_device: str = "",
         if not chain:
             return None
         scols = _columns(conn, "sessions")
-        mcols = [c for c in _columns(conn, "messages") if c != "id"]  # 丟棄來源 id
+        mcols = [c for c in _columns(conn, "messages") if c != "id"]  # drop source id
 
         placeholders = ",".join("?" * len(chain))
         sessions = [
@@ -139,12 +144,14 @@ def export_session(db_path: str, session_id: str, source_device: str = "",
 
 def export_all(db_path: str, source_device: str = "",
                exported_at: float = 0.0) -> Dict[str, Any]:
-    """匯出整個 state.db 的「所有」session + message 成單一 bundle（#22 反向同步）。
+    """Export every session + message in the whole state.db into a single bundle (#22 reverse sync).
 
-    用於手機→桌面的最終一致同步：一次把本機全部對話打包回傳，桌面以 import_bundle
-    （by-id upsert + 自然鍵去重）冪等合併。與 export_session 同 bundle 格式，差別在不解
-    連通鏈、而是全表 dump。空 db 回傳 sessions/messages 皆空的合法 bundle（非 None）。
-    messages 已丟棄來源自增 id（讓對端 AUTOINCREMENT 配新 id）。
+    Used for eventual-consistency mobile→desktop sync: package up all local conversations
+    at once, and the desktop merges them idempotently via import_bundle (by-id upsert +
+    natural-key dedup). Same bundle format as export_session, except it does not resolve
+    connected chains but dumps the entire tables. An empty db returns a valid bundle with
+    empty sessions/messages (not None). messages already have the source autoincrement id
+    dropped (so the peer's AUTOINCREMENT assigns new ids).
     """
     conn = _connect(db_path)
     try:
@@ -170,7 +177,7 @@ def export_all(db_path: str, source_device: str = "",
         conn.close()
 
 
-# ── 匯入合併 ──────────────────────────────────────────────────────────────
+# ── import merge ────────────────────────────────────────────────────────────
 
 def _natural_key(m: Dict[str, Any]) -> str:
     raw = "\x1f".join(
@@ -180,12 +187,12 @@ def _natural_key(m: Dict[str, Any]) -> str:
 
 
 def import_bundle(db_path: str, bundle: Dict[str, Any]) -> Dict[str, int]:
-    """把 bundle 合併進本機 state.db。回傳統計。
+    """Merge a bundle into the local state.db. Returns statistics.
 
-    - sessions：by id upsert（INSERT OR IGNORE，不覆蓋本機既有 → 保留本機端 metadata）
-    - messages：自然鍵去重後 INSERT（丟棄來源 id、讓本機 AUTOINCREMENT 配新 id）
-    - FTS5 由 trigger 自動維護
-    冪等：同一 bundle 重複匯入不會產生重複 message。
+    - sessions: upsert by id (INSERT OR IGNORE, does not overwrite local existing → preserves local-side metadata)
+    - messages: INSERT after natural-key dedup (drop source id, let local AUTOINCREMENT assign a new id)
+    - FTS5 maintained automatically by triggers
+    Idempotent: importing the same bundle repeatedly produces no duplicate messages.
     """
     if bundle.get("schema") != SCHEMA:
         raise ValueError(f"unsupported bundle schema: {bundle.get('schema')}")
@@ -197,8 +204,8 @@ def import_bundle(db_path: str, bundle: Dict[str, Any]) -> Dict[str, int]:
         local_scols = set(_columns(conn, "sessions"))
         local_mcols = set(_columns(conn, "messages"))
 
-        with conn:  # 單一交易（全有或全無）
-            # 1. sessions：upsert（不覆蓋既有）
+        with conn:  # single transaction (all-or-nothing)
+            # 1. sessions: upsert (does not overwrite existing)
             for s in bundle.get("sessions", []):
                 cols = [c for c in s.keys() if c in local_scols]
                 exists = conn.execute(
@@ -214,8 +221,8 @@ def import_bundle(db_path: str, bundle: Dict[str, Any]) -> Dict[str, int]:
                 )
                 stats["sessions_added"] += 1
 
-            # 2. messages：自然鍵去重 → 只插新訊息
-            #    先載入每個目標 session 既有訊息的自然鍵集合
+            # 2. messages: natural-key dedup → insert only new messages
+            #    first load the natural-key set of existing messages for each target session
             target_sids = {m["session_id"] for m in bundle.get("messages", [])}
             existing_keys: Set[str] = set()
             for sid in target_sids:
@@ -236,21 +243,22 @@ def import_bundle(db_path: str, bundle: Dict[str, Any]) -> Dict[str, int]:
                     f"VALUES ({','.join('?' * len(cols))})",
                     [m[c] for c in cols],
                 )
-                existing_keys.add(key)  # 防 bundle 內自身重複
+                existing_keys.add(key)  # guard against duplicates within the bundle itself
                 stats["messages_added"] += 1
         return stats
     finally:
         conn.close()
 
 
-# ── memory append-union（M1：安全、不覆蓋、衝突保留）────────────────────────
+# ── memory append-union (M1: safe, non-overwriting, conflict-preserving) ──────
 
 def merge_memory_text(local: str, incoming: str) -> str:
-    """把 incoming 的記憶條目併入 local（行級 union），保留 local 既有、只加新行。
+    """Merge incoming memory entries into local (line-level union), preserving local existing and only adding new lines.
 
-    M1 安全策略：不刪、不覆蓋；incoming 有而 local 沒有的「非空行」附加到末尾，
-    標註來源區塊。真正的 3-way（含刪除傳播）留待 M3（屆時用 .sync-base 當共同祖先）。
-    回傳合併後文字；若無新增則原樣回傳。
+    M1 safety policy: no deletion, no overwriting; "non-empty lines" present in incoming
+    but not in local are appended to the end, marked with a source block. True 3-way
+    (with deletion propagation) is deferred to M3 (which will use .sync-base as the common
+    ancestor). Returns the merged text; if nothing is added, returns it unchanged.
     """
     local_lines = local.splitlines()
     local_set = {ln.strip() for ln in local_lines if ln.strip()}
@@ -266,7 +274,7 @@ def merge_memory_text(local: str, incoming: str) -> str:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    """原子寫文字檔（tmp + os.replace），避免半寫狀態。"""
+    """Atomically write a text file (tmp + os.replace) to avoid half-written state."""
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".mem-")
     try:
@@ -282,11 +290,13 @@ def _atomic_write_text(path: str, text: str) -> None:
 
 
 def import_memory(hermes_home: str, memory: Dict[str, str]) -> Dict[str, int]:
-    """把 bundle 的 memory（{檔名: 內容}）append-union 進本機 memories/*.md。
+    """Append-union the bundle's memory ({filename: content}) into the local memories/*.md.
 
-    安全（檔名來自 bundle，不可信）：只接受「純檔名」的 .md（拒路徑穿越 `../`、子目錄）；
-    既有檔若是 symlink 則跳過（防寫穿到 .env 等）；寫入前確認目錄 realpath 仍在 memories/ 內。
-    不刪不覆蓋（沿用 merge_memory_text 的 M1 策略）。回傳統計。
+    Safety (filenames come from the bundle and are untrusted): only accept "plain filename"
+    .md files (reject path traversal `../` and subdirectories); skip existing files that are
+    symlinks (to prevent writing through to .env etc.); before writing, confirm the
+    directory's realpath is still inside memories/. No deletion, no overwriting (reuses
+    merge_memory_text's M1 policy). Returns statistics.
     """
     stats = {"mem_added": 0, "mem_merged": 0, "mem_unchanged": 0}
     if not memory:
@@ -298,10 +308,10 @@ def import_memory(hermes_home: str, memory: Dict[str, str]) -> Dict[str, int]:
         if not isinstance(name, str) or not name.endswith(".md"):
             continue
         if name in (".", "..") or os.path.basename(name) != name:
-            continue  # 拒路徑穿越/子目錄
+            continue  # reject path traversal / subdirectory
         path = os.path.join(mem_dir, name)
         if os.path.islink(path):
-            continue  # 既有 symlink → 不安全，跳過
+            continue  # existing symlink → unsafe, skip
         if os.path.commonpath([os.path.realpath(os.path.dirname(path)), real_mem]) != real_mem:
             continue
         existed = os.path.isfile(path)
@@ -322,7 +332,7 @@ def import_memory(hermes_home: str, memory: Dict[str, str]) -> Dict[str, int]:
 
 
 def import_all(hermes_home: str, bundle: Dict[str, Any]) -> Dict[str, Any]:
-    """手機端單一匯入入口：state.db（sessions/messages）+ memories/ 一起合併。回傳合併統計。"""
+    """Single mobile-side import entry point: merge state.db (sessions/messages) + memories/ together. Returns merge statistics."""
     db = os.path.join(hermes_home, "state.db")
     stats: Dict[str, Any] = dict(import_bundle(db, bundle))
     stats.update(import_memory(hermes_home, bundle.get("memory") or {}))

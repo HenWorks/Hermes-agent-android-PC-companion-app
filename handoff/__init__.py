@@ -1,14 +1,15 @@
 """
-hermes 接力 — 桌面 plugin 入口（#5b）。
+hermes handoff — desktop plugin entry point (#5b).
 
-放到 `~/.hermes/plugins/handoff/`，hermes 啟動載入 plugin 時呼叫 register(ctx) →
-在背景啟動 HandoffServer（mDNS 廣告 + 加密 TCP serve），把對話接力給已配對的手機。
-不碰上游 Electron，只讀寫 ~/.hermes。
+Place under `~/.hermes/plugins/handoff/`. When hermes starts and loads the plugin
+it calls register(ctx) → starts a HandoffServer in the background (mDNS advertising +
+encrypted TCP serve), handing off conversations to paired phones.
+Does not touch upstream Electron; only reads/writes ~/.hermes.
 
-也可不靠 plugin 系統獨立執行（測試/手動）：
-    python -m handoff serve            # 啟動 server（前景）
-    python -m handoff pair             # 啟動並印出配對 QR 內容
-相依：PyNaCl, zeroconf（見 requirements.txt）。
+Can also run standalone without the plugin system (testing/manual):
+    python -m handoff serve            # start server (foreground)
+    python -m handoff pair             # start and print pairing QR content
+Dependencies: PyNaCl, zeroconf (see requirements.txt).
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import os
 import sys
 import threading
 
-# 讓套件內模組維持 flat import（import handoff_core / pairing ...，與測試一致）
+# Keep flat imports for in-package modules (import handoff_core / pairing ..., consistent with tests)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import desktop_export as _de  # noqa: E402
@@ -25,7 +26,7 @@ import pairing as _pr         # noqa: E402
 
 __all__ = ["register", "serve", "pairing_qr", "handoff_qr"]
 
-_HANDOFF_SUBDIR = "handoff"   # ~/.hermes/handoff/（身分金鑰 + 配對方清單）
+_HANDOFF_SUBDIR = "handoff"   # ~/.hermes/handoff/ (identity key + peer list)
 
 
 def _hermes_home(explicit: str | None = None) -> str:
@@ -35,7 +36,7 @@ def _hermes_home(explicit: str | None = None) -> str:
 
 
 def serve(home: str | None = None, advertise: bool = True) -> _hs.HandoffServer:
-    """啟動接力 server（綁本機 ~/.hermes）。回傳已啟動的 HandoffServer。"""
+    """Start the handoff server (bound to local ~/.hermes). Returns the started HandoffServer."""
     home = _hermes_home(home)
     cfg_dir = os.path.join(home, _HANDOFF_SUBDIR)
     os.makedirs(cfg_dir, exist_ok=True)
@@ -44,30 +45,30 @@ def serve(home: str | None = None, advertise: bool = True) -> _hs.HandoffServer:
     server = _hs.HandoffServer(
         identity=identity, peers=peers,
         export_fn=lambda sid: _de.export_for_handoff(
-            home, sid, source_device=identity.device_id))  # host 預設綁 LAN IP，絕不 0.0.0.0
+            home, sid, source_device=identity.device_id))  # host binds to LAN IP by default, never 0.0.0.0
     server.start(advertise=advertise)
     return server
 
 
 def pairing_qr(server: _hs.HandoffServer) -> str:
-    """產生此 server 的純配對 QR 內容（給手機掃，僅建立信任）。"""
+    """Produce this server's pure pairing QR content (for the phone to scan, establishes trust only)."""
     return _pr.build_pair_qr(server.identity, _hs._local_ip(), server.port)
 
 
 def handoff_qr(server: _hs.HandoffServer, session_id: str) -> str:
-    """產生此 server 的接力 QR 內容：配對資訊 + 指定 session_id。手機首掃即配對 +
-    選定要接收的對話。"""
+    """Produce this server's handoff QR content: pairing info + the given session_id. The phone's
+    first scan both pairs and selects the conversation to receive."""
     return _pr.build_handoff_qr(server.identity, _hs._local_ip(), server.port, session_id)
 
 
-def register(ctx) -> None:  # noqa: ARG001 — ctx 介面依 hermes plugin 系統
-    """hermes plugin 進入點：啟動接力 server（背景 daemon thread，隨 hermes 程序生命週期）。"""
+def register(ctx) -> None:  # noqa: ARG001 — ctx interface per the hermes plugin system
+    """hermes plugin entry point: start the handoff server (background daemon thread, tied to the hermes process lifecycle)."""
     def _start():
         try:
             srv = serve()
-            # 記錄 device_id / port，方便使用者在桌面 UI/日誌找配對資訊
-            print(f"[handoff] 接力 server 啟動 device_id={srv.identity.device_id} "
-                  f"port={srv.port}（mDNS 廣告中）")
-        except Exception as e:  # noqa: BLE001 — plugin 啟動失敗不該拖垮 hermes
-            print(f"[handoff] 啟動失敗：{e}", file=sys.stderr)
+            # Log device_id / port so the user can find pairing info in the desktop UI/logs
+            print(f"[handoff] handoff server started device_id={srv.identity.device_id} "
+                  f"port={srv.port} (mDNS advertising)")
+        except Exception as e:  # noqa: BLE001 — a plugin startup failure should not bring down hermes
+            print(f"[handoff] startup failed: {e}", file=sys.stderr)
     threading.Thread(target=_start, name="handoff-server", daemon=True).start()

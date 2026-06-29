@@ -1,7 +1,7 @@
-"""hermes 接力（桌面側）獨立 CLI：
-    python -m handoff serve [--home ~/.hermes]                  # 啟動 server（前景）
-    python -m handoff pair  [--home ~/.hermes]                  # 啟動並印出配對 QR
-    python -m handoff handoff --session <id> [--home ~/.hermes] # 啟動並印出接力 QR
+"""hermes handoff (desktop side) standalone CLI:
+    python -m handoff serve [--home ~/.hermes]                  # start server (foreground)
+    python -m handoff pair  [--home ~/.hermes]                  # start and print pairing QR
+    python -m handoff handoff --session <id> [--home ~/.hermes] # start and print handoff QR
 """
 from __future__ import annotations
 
@@ -13,32 +13,32 @@ from . import handoff_qr, pairing_qr, serve
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="handoff", description="hermes 接力（桌面側）")
+    ap = argparse.ArgumentParser(prog="handoff", description="hermes handoff (desktop side)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, help_ in (("serve", "啟動接力 server（前景）"),
-                        ("pair", "啟動並印出配對 QR 內容"),
-                        ("handoff", "啟動並印出指定 session 的接力 QR")):
+    for name, help_ in (("serve", "start the handoff server (foreground)"),
+                        ("pair", "start and print the pairing QR content"),
+                        ("handoff", "start and print the handoff QR for a given session")):
         s = sub.add_parser(name, help=help_)
-        s.add_argument("--home", default=None, help="HERMES_HOME（預設 ~/.hermes）")
+        s.add_argument("--home", default=None, help="HERMES_HOME (default ~/.hermes)")
         if name == "handoff":
-            s.add_argument("--session", required=True, help="要接力給手機的 session_id")
+            s.add_argument("--session", required=True, help="the session_id to hand off to the phone")
     a = ap.parse_args(argv)
 
     srv = serve(a.home)
-    print(f"[handoff] device_id={srv.identity.device_id} port={srv.port}（mDNS 廣告中）")
+    print(f"[handoff] device_id={srv.identity.device_id} port={srv.port} (mDNS advertising)")
     if a.cmd == "pair":
-        print("配對 QR 內容（給手機掃）：")
+        print("Pairing QR content (for the phone to scan):")
         print(pairing_qr(srv))
     elif a.cmd == "handoff":
-        print(f"接力 QR 內容（給手機掃，session={a.session}）：")
+        print(f"Handoff QR content (for the phone to scan, session={a.session}):")
         print(handoff_qr(srv, a.session))
-    print("server 執行中，Ctrl+C 結束。")
+    print("Server running, press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
         srv.stop()
-        print("\n已停止。")
+        print("\nStopped.")
     return 0
 
 

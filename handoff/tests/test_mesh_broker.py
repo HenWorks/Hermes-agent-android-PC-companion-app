@@ -1,12 +1,12 @@
 """
-mesh_broker 單元測試 — 純 python3 可跑（無 pytest 相依）：
+mesh_broker unit tests — runs on pure python3 (no pytest dependency):
     python3 handoff/tests/test_mesh_broker.py
 
-驗證：
-- 配對信任：未配對 client 被拒
-- push → worker 跑 hermes(stub) oneshot → poll 收到加密結果 → ack 後清空
-- payload e2e：poll 結果用 Box(broker_sk→phone_pk) 加密、手機端可解
-- 任務 prompt 以「參數」帶入子程序（不經 shell，防注入）
+Verifies:
+- pairing trust: unpaired client is rejected
+- push → worker runs hermes(stub) oneshot → poll receives encrypted result → cleared after ack
+- payload e2e: poll result is encrypted with Box(broker_sk→phone_pk), decryptable on the phone
+- task prompt is passed into the subprocess as an "argument" (not via shell, prevents injection)
 """
 import json
 import os
@@ -21,18 +21,18 @@ import pairing as pr          # noqa: E402
 import handoff_server as hs   # noqa: E402
 import mesh_broker as mb      # noqa: E402
 
-# stub hermes：把 prompt 原樣回 echo（worker 會 append prompt 成最後一個 argv）
+# stub hermes: echoes the prompt back verbatim (worker appends prompt as the last argv)
 ECHO_CMD = ["python3", "-c", "import sys;print('ECHO:'+sys.argv[1])"]
 
 
 def _client_op(host, port, phone, broker_pk, req: dict, encrypted_reply: bool):
-    """模擬手機：hello → 加密請求 → 收回應（依 encrypted_reply 決定是否解密）。"""
+    """Simulate the phone: hello → encrypted request → receive reply (decrypt depends on encrypted_reply)."""
     with socket.create_connection((host, port), timeout=5) as c:
         # hello
         hs._send_frame(c, json.dumps({"did": phone.device_id, "pk": phone.public_b64}).encode())
         ack = json.loads(hs._recv_frame(c).decode())
-        assert ack.get("ok"), f"握手被拒：{ack}"
-        # 加密請求
+        assert ack.get("ok"), f"handshake rejected: {ack}"
+        # encrypted request
         hs._send_frame(c, pr.box_encrypt(phone.private_key, broker_pk, json.dumps(req).encode()))
         raw = hs._recv_frame(c)
         if encrypted_reply:
@@ -67,7 +67,7 @@ def _poll_until_result(host, port, phone, bpk, tries=50):
 def test_unpaired_rejected():
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
-        broker, bid = _make_broker(tmp, paired_phone=None)  # 不配對
+        broker, bid = _make_broker(tmp, paired_phone=None)  # not paired
         try:
             with socket.create_connection((broker.host, broker.port), timeout=5) as c:
                 hs._send_frame(c, json.dumps(
@@ -85,13 +85,13 @@ def test_push_run_poll_ack():
         broker, bid = _make_broker(tmp, paired_phone=phone)
         bpk = bytes(bid.public_key)
         try:
-            # 1. push 任務
+            # 1. push task
             r = _client_op(broker.host, broker.port, phone, bpk,
                            {"op": "push", "task": {"prompt": "hello-mesh"}}, encrypted_reply=False)
             assert r.get("ok") and r.get("id"), r
             tid = r["id"]
 
-            # 2. 等 worker 跑完（poll 直到有結果，最多 10s）
+            # 2. wait for the worker to finish (poll until there is a result, up to 10s)
             results = []
             for _ in range(50):
                 resp = _client_op(broker.host, broker.port, phone, bpk,
@@ -101,27 +101,27 @@ def test_push_run_poll_ack():
                 if results:
                     break
                 time.sleep(0.2)
-            assert results, "worker 未產生結果（逾時）"
+            assert results, "worker produced no result (timeout)"
             res = results[0]
             assert res["ref"] == tid, res
             assert res["ok"] is True, res
-            # stub hermes 把 prompt 原樣回；worker 會在 prompt 前加可辨識前綴（桌面端認來源）
+            # stub hermes echoes the prompt verbatim; worker prepends an identifiable marker (desktop recognizes the source)
             assert res["text"] == f"ECHO:{mb.MESH_TASK_MARKER}hello-mesh", res
-            print("✓ test_push_run_poll_ack（push→worker→poll 加密往返）")
+            print("✓ test_push_run_poll_ack (push→worker→poll encrypted round-trip)")
 
-            # 3. ack 後 poll 應清空
+            # 3. after ack, poll should be cleared
             _client_op(broker.host, broker.port, phone, bpk,
                        {"op": "ack", "ids": [res["id"]]}, encrypted_reply=False)
             resp = _client_op(broker.host, broker.port, phone, bpk,
                               {"op": "poll"}, encrypted_reply=True)
             assert resp.get("results") == [], resp
-            print("✓ ack 後 poll 清空")
+            print("✓ poll cleared after ack")
         finally:
             broker.stop()
 
 
 def test_prompt_not_shell_injected():
-    """prompt 含 shell metachar 不會被執行（以參數帶入，非 shell 拼接）。"""
+    """A prompt containing shell metacharacters is not executed (passed as an argument, not shell-concatenated)."""
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
         broker, bid = _make_broker(tmp, paired_phone=phone)
@@ -138,41 +138,41 @@ def test_prompt_not_shell_injected():
                 if results:
                     break
                 time.sleep(0.2)
-            assert results, "逾時"
-            # echo stub 把整個 prompt 原樣回；"PWNED" 只會出現在 echo 文字內、非被 shell 執行
+            assert results, "timeout"
+            # echo stub echoes the entire prompt verbatim; "PWNED" only appears inside the echo text, not executed by a shell
             assert results[0]["text"] == f"ECHO:{mb.MESH_TASK_MARKER}{danger}", results[0]
-            print("✓ test_prompt_not_shell_injected（prompt 以參數帶入、未經 shell）")
+            print("✓ test_prompt_not_shell_injected (prompt passed as an argument, not via shell)")
         finally:
             broker.stop()
 
 
 def test_pair_then_push():
-    """配對視窗內：未配對手機 pair → 加入信任 → push 可用。"""
+    """Within the pairing window: unpaired phone pairs → added to trust → push works."""
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
-        broker, bid = _make_broker(tmp, paired_phone=None, pairing=True)  # 開配對視窗、未預先配對
+        broker, bid = _make_broker(tmp, paired_phone=None, pairing=True)  # open pairing window, not pre-paired
         bpk = bytes(bid.public_key)
         try:
-            # pair（未配對 + 視窗內 → 應成功）
+            # pair (not paired + within window → should succeed)
             r = _client_op(broker.host, broker.port, phone, bpk, {"op": "pair"}, encrypted_reply=False)
             assert r.get("ok") and r.get("did") == bid.device_id, r
-            assert broker.peers.is_paired(phone.device_id, bytes(phone.public_key)), "pair 後未存入信任"
-            # 配對後 push 可用
+            assert broker.peers.is_paired(phone.device_id, bytes(phone.public_key)), "not stored in trust after pair"
+            # push works after pairing
             r2 = _client_op(broker.host, broker.port, phone, bpk,
                             {"op": "push", "task": {"prompt": "after-pair"}}, encrypted_reply=False)
             assert r2.get("ok"), r2
             results = _poll_until_result(broker.host, broker.port, phone, bpk)
             assert results and results[0]["text"] == f"ECHO:{mb.MESH_TASK_MARKER}after-pair", results
-            print("✓ test_pair_then_push（視窗內 pair → push 往返）")
+            print("✓ test_pair_then_push (pair within window → push round-trip)")
         finally:
             broker.stop()
 
 
 def test_pair_rejected_outside_window():
-    """配對視窗未開（或已關）：未配對手機連線即被拒、pair 也不得逞。"""
+    """Pairing window not open (or already closed): unpaired phone is rejected on connect, and pair cannot succeed."""
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
-        broker, bid = _make_broker(tmp, paired_phone=None, pairing=False)  # 不開窗
+        broker, bid = _make_broker(tmp, paired_phone=None, pairing=False)  # do not open window
         try:
             with socket.create_connection((broker.host, broker.port), timeout=5) as c:
                 hs._send_frame(c, json.dumps(
@@ -180,53 +180,53 @@ def test_pair_rejected_outside_window():
                 ack = json.loads(hs._recv_frame(c).decode())
             assert ack.get("ok") is False and "not paired" in ack.get("err", ""), ack
             assert not broker.peers.is_paired(phone.device_id, bytes(phone.public_key))
-            print("✓ test_pair_rejected_outside_window（窗外未配對連線即拒）")
+            print("✓ test_pair_rejected_outside_window (unpaired connection outside the window is rejected)")
         finally:
             broker.stop()
 
 
 def test_ack_bound_to_owner():
-    """ack 綁認證身分：手機 B 不能刪手機 A 的結果。"""
+    """ack is bound to the authenticated identity: phone B cannot delete phone A's result."""
     with tempfile.TemporaryDirectory() as tmp:
         a = pr.load_or_create_identity(os.path.join(tmp, "a.key"))
         b = pr.load_or_create_identity(os.path.join(tmp, "b.key"))
         broker, bid = _make_broker(tmp, paired_phone=a)
-        broker.peers.add(b.device_id, bytes(b.public_key))  # B 也已配對
+        broker.peers.add(b.device_id, bytes(b.public_key))  # B is also paired
         bpk = bytes(bid.public_key)
         try:
-            # A push → 產生屬於 A 的結果
+            # A push → produces a result belonging to A
             _client_op(broker.host, broker.port, a, bpk,
                        {"op": "push", "task": {"prompt": "for-a"}}, encrypted_reply=False)
             a_results = _poll_until_result(broker.host, broker.port, a, bpk)
-            assert a_results, "A 無結果"
+            assert a_results, "A has no result"
             a_res_id = a_results[0]["id"]
 
-            # B 嘗試 ack A 的 result id → 不該刪掉 A 的結果
+            # B tries to ack A's result id → must not delete A's result
             _client_op(broker.host, broker.port, b, bpk,
                        {"op": "ack", "ids": [a_res_id]}, encrypted_reply=False)
             still = _client_op(broker.host, broker.port, a, bpk, {"op": "poll"}, encrypted_reply=True)
-            assert any(x["id"] == a_res_id for x in still["results"]), "B 竟刪掉了 A 的結果！"
-            print("✓ test_ack_bound_to_owner（B 無法刪 A 的結果）")
+            assert any(x["id"] == a_res_id for x in still["results"]), "B actually deleted A's result!"
+            print("✓ test_ack_bound_to_owner (B cannot delete A's result)")
         finally:
             broker.stop()
 
 
 def test_requeue_running_on_restart():
-    """啟動 requeue：卡 running 的任務還原 pending。"""
+    """Startup requeue: tasks stuck in running are restored to pending."""
     with tempfile.TemporaryDirectory() as tmp:
         store = mb.MeshStore(os.path.join(tmp, "q.db"))
         store.add_task("t1", "didX", "p")
         store.claim_next_task()  # → running
         n = store.requeue_running()
         assert n == 1, n
-        again = store.claim_next_task()  # 應能再次取到
+        again = store.claim_next_task()  # should be claimable again
         assert again and again["id"] == "t1", again
         print("✓ test_requeue_running_on_restart")
 
 
 def _pull(host, port, phone, bpk, session_id):
-    """接力 client 流程：hello → Box({op:pull,session_id}) → 收 {ok} →（成功才）收 Box(bundle)。
-    回 (ack_dict, bundle_or_None)。對齊 broker._op_pull 的雙 frame 回應協定。"""
+    """Handoff client flow: hello → Box({op:pull,session_id}) → receive {ok} → (only on success) receive Box(bundle).
+    Returns (ack_dict, bundle_or_None). Matches broker._op_pull's two-frame response protocol."""
     with socket.create_connection((host, port), timeout=5) as c:
         hs._send_frame(c, json.dumps({"did": phone.device_id, "pk": phone.public_b64}).encode())
         if not json.loads(hs._recv_frame(c).decode()).get("ok"):
@@ -241,8 +241,8 @@ def _pull(host, port, phone, bpk, session_id):
 
 
 def test_pull_session_handoff():
-    """接力 op（統一 server）：已配對手機 pull session → 收 {ok} + Box(bundle) 解得 bundle；
-    找不到的 session 誠實回 {ok:false}。協作與接力共用同一連線協定 + 同一信任域。"""
+    """Handoff op (unified server): paired phone pulls a session → receives {ok} + Box(bundle) decrypts to bundle;
+    a session not found honestly returns {ok:false}. Collaboration and handoff share the same connection protocol + same trust domain."""
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
         broker, bid = _make_broker(tmp, paired_phone=phone)
@@ -257,23 +257,23 @@ def test_pull_session_handoff():
             ack2, b2 = _pull(broker.host, broker.port, phone, bpk, "nope")
             assert ack2.get("ok") is False and "not found" in ack2.get("err", ""), ack2
             assert b2 is None
-            print("✓ test_pull_session_handoff（接力 pull 往返 + 找不到 session 誠實回報）")
+            print("✓ test_pull_session_handoff (handoff pull round-trip + honest report when session not found)")
         finally:
             mb.de.export_for_handoff = orig
             broker.stop()
 
 
 def test_pull_requires_pairing():
-    """接力不繞過信任：配對視窗開但未配對 → pull 仍被拒（op != pair 時要求已配對）。"""
+    """Handoff does not bypass trust: pairing window open but not paired → pull still rejected (op != pair requires being paired)."""
     with tempfile.TemporaryDirectory() as tmp:
         phone = pr.load_or_create_identity(os.path.join(tmp, "phone.key"))
-        broker, bid = _make_broker(tmp, paired_phone=None, pairing=True)  # 視窗開、但未配對
+        broker, bid = _make_broker(tmp, paired_phone=None, pairing=True)  # window open, but not paired
         bpk = bytes(bid.public_key)
         try:
             ack, bundle = _pull(broker.host, broker.port, phone, bpk, "s1")
             assert ack.get("ok") is False and "not paired" in ack.get("err", ""), ack
             assert bundle is None
-            print("✓ test_pull_requires_pairing（未配對不可接力，即使配對視窗開）")
+            print("✓ test_pull_requires_pairing (cannot hand off unpaired, even with pairing window open)")
         finally:
             broker.stop()
 
@@ -288,4 +288,4 @@ if __name__ == "__main__":
     test_requeue_running_on_restart()
     test_pull_session_handoff()
     test_pull_requires_pairing()
-    print("\n所有 mesh_broker 測試通過 ✅")
+    print("\nall mesh_broker tests passed ✅")

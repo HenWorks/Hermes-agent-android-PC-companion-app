@@ -1,17 +1,21 @@
 """
-desktop_export — 桌面側接力匯出（M1，桌面 → 手機）。
+desktop_export — desktop-side handoff export (M1, desktop -> phone).
 
-純標準庫。職責：
-1. 用 sqlite3.backup() 對 live state.db 取「一致快照」（不碰 WAL、不被寫入干擾），
-   再從快照抽單一 session 連通鏈 → bundle（複用 handoff_core.export_session）。
-2. 收 memories/*.md 快照併入 bundle（手機端做 append-union）。
-3. 單一 owner 鎖：匯出本身**唯讀**；待傳輸確認後才呼叫 mark_handed_off() 把來源 session
-   標 handoff_state='completed' + archived=1（之後桌面不再續寫該 session）。失敗用
-   release_handoff() 解鎖可重試。
+Pure standard library. Responsibilities:
+1. Take a "consistent snapshot" of the live state.db via sqlite3.backup() (does not
+   touch WAL, immune to concurrent writes), then extract a single session's connected
+   chain from the snapshot -> bundle (reuses handoff_core.export_session).
+2. Collect a snapshot of memories/*.md into the bundle (phone side does append-union).
+3. Single-owner lock: the export itself is **read-only**; only after transfer is
+   confirmed do we call mark_handed_off() to mark the source session
+   handoff_state='completed' + archived=1 (after which the desktop no longer writes to
+   that session). On failure, release_handoff() unlocks it for retry.
 
-🔴 機密永不入 bundle：本模組只讀 state.db + memories/，絕不碰 auth.json/.env。
+🔴 Secrets never enter the bundle: this module only reads state.db + memories/, and
+never touches auth.json/.env.
 
-之後 #5b 會把這些函式包成 hermes plugin（register(ctx) 背景服務）；M1 先用 CLI 驗：
+Later, #5b will wrap these functions into a hermes plugin (register(ctx) background
+service); M1 verifies via CLI first:
     python3 desktop_export.py --home ~/.hermes --session <uuid> --out bundle.json
 """
 from __future__ import annotations
@@ -30,10 +34,12 @@ import handoff_core as hc  # noqa: E402
 
 
 def _snapshot(state_db: str) -> str:
-    """用 sqlite3.backup() 取 state.db 的一致快照到暫存檔，回傳快照路徑。
+    """Take a consistent snapshot of state.db into a temp file via sqlite3.backup(),
+    returning the snapshot path.
 
-    比照上游 backup.py：唯讀開啟來源 + backup() API → 即使 hermes 正在寫也安全，
-    且不複製 -wal/-shm。呼叫端負責刪除回傳的暫存檔。
+    Mirrors upstream backup.py: open the source read-only + backup() API -> safe even
+    while hermes is writing, and does not copy -wal/-shm. The caller is responsible for
+    deleting the returned temp file.
     """
     fd, snap = tempfile.mkstemp(prefix="hermes-handoff-snap-", suffix=".db")
     os.close(fd)
@@ -50,10 +56,11 @@ def _snapshot(state_db: str) -> str:
 
 
 def _read_memory(hermes_home: str) -> dict:
-    """讀 memories/*.md 成 {filename: content}。無目錄則回空。
+    """Read memories/*.md into {filename: content}. Returns empty if the dir is absent.
 
-    安全（review P2）：**跳過 symlink / 非 regular file**，且每個檔的 realpath 必須落在
-    memories/ 內 —— 防 `memories/SECRET.md -> ../.env` 這類 symlink 把機密讀進 bundle。
+    Security (review P2): **skip symlinks / non-regular files**, and each file's realpath
+    must reside within memories/ — guards against a symlink like
+    `memories/SECRET.md -> ../.env` reading secrets into the bundle.
     """
     mem_dir = os.path.join(hermes_home, "memories")
     out = {}
@@ -63,10 +70,10 @@ def _read_memory(hermes_home: str) -> dict:
     for path in sorted(glob.glob(os.path.join(mem_dir, "*.md"))):
         try:
             if os.path.islink(path) or not os.path.isfile(path):
-                continue  # 跳過 symlink 與非一般檔
+                continue  # skip symlinks and non-regular files
             rp = os.path.realpath(path)
             if os.path.commonpath([rp, real_mem]) != real_mem:
-                continue  # realpath 逃出 memories/ → 拒讀
+                continue  # realpath escapes memories/ -> refuse to read
             with open(path, encoding="utf-8") as f:
                 out[os.path.basename(path)] = f.read()
         except (OSError, ValueError):
@@ -76,13 +83,14 @@ def _read_memory(hermes_home: str) -> dict:
 
 def export_for_handoff(hermes_home: str, session_id: str,
                        source_device: str = "", include_memory: bool = True) -> dict | None:
-    """產生接力 bundle（唯讀，不動 live db）。回傳 None 表示找不到 session。"""
+    """Produce a handoff bundle (read-only, does not touch the live db). Returns None
+    if the session is not found."""
     state_db = os.path.join(hermes_home, "state.db")
     if not os.path.isfile(state_db):
         raise FileNotFoundError(f"state.db not found: {state_db}")
     snap = _snapshot(state_db)
     try:
-        # 只支援 0.16.0+ 桌面：schema 不符就 fail-fast（不產 bundle）
+        # Only 0.16.0+ desktops are supported: fail-fast on schema mismatch (no bundle)
         guard = sqlite3.connect(snap)
         try:
             _require_handoff_schema(guard)
@@ -102,22 +110,26 @@ def export_for_handoff(hermes_home: str, session_id: str,
             pass
 
 
-# ── 支援版本守衛（只支援 0.16.0+ 桌面，schema_version >= 15）──────────────
-# 政策：只支援 0.16.0+ 桌面 → 缺 handoff 欄位就 fail-fast 報清楚的錯（不再 sidecar 軟鎖）。
+# ── Supported-version guard (only 0.16.0+ desktops, schema_version >= 15) ──────────────
+# Policy: only 0.16.0+ desktops are supported -> if handoff columns are missing, fail-fast
+# with a clear error (no more sidecar soft-lock).
 _REQUIRED_LOCK_COLS = ("handoff_state", "handoff_platform", "archived")
 _MIN_SCHEMA_VERSION = 15  # hermes 0.16.0
 
 
 class UnsupportedDesktopError(RuntimeError):
-    """桌面 hermes 版本過舊（< 0.16.0），不支援接力。"""
+    """The desktop hermes version is too old (< 0.16.0) and does not support handoff."""
 
 
 def _require_handoff_schema(conn: sqlite3.Connection) -> None:
-    """handoff「欄位能力」守衛：sessions 須具 handoff_state/handoff_platform/archived。
+    """handoff "column capability" guard: sessions must have
+    handoff_state/handoff_platform/archived.
 
-    這三欄是 0.16.0(schema v15) 引入的，故缺欄位 ≈ 桌面 < 0.16.0。實際判定看「欄位是否
-    存在」而非嚴格 schema_version（即使無 schema_version table，只要三欄齊備即可接力）；
-    schema_version 僅用於錯誤訊息輔助說明。
+    These three columns were introduced in 0.16.0 (schema v15), so missing columns
+    ≈ desktop < 0.16.0. The actual check looks at whether the columns exist rather than a
+    strict schema_version (even without a schema_version table, handoff is allowed as long
+    as the three columns are present); schema_version is only used to enrich the error
+    message.
     """
     have = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
     missing = [c for c in _REQUIRED_LOCK_COLS if c not in have]
@@ -129,13 +141,15 @@ def _require_handoff_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.Error:
             pass
         raise UnsupportedDesktopError(
-            f"桌面 hermes-agent 缺接力所需欄位 {missing}（schema_version={ver}，"
-            f"需 0.16.0+ / schema v{_MIN_SCHEMA_VERSION}）。請更新桌面版。")
+            f"Desktop hermes-agent is missing handoff columns {missing} "
+            f"(schema_version={ver}, requires 0.16.0+ / schema v{_MIN_SCHEMA_VERSION}). "
+            f"Please update the desktop version.")
 
 
-# ── 單一 owner 鎖（寫 live db；傳輸確認後才呼叫）──────────────────────────
-# 對 bundle 整條鏈的「所有」session 一起標記/解鎖（export 帶整條鏈，只標一個會漏）。
-# 假設 0.16.0+ schema（欄位必存在，由守衛保證）。
+# ── Single-owner lock (writes the live db; only called after transfer is confirmed) ────
+# Mark/unlock "all" sessions in the bundle's entire chain together (the export carries the
+# whole chain, so marking only one would miss some).
+# Assumes a 0.16.0+ schema (columns guaranteed to exist by the guard).
 
 def _chain_for(conn: sqlite3.Connection, session_id: str) -> list:
     return hc.resolve_chain(conn, session_id) or [session_id]
@@ -144,18 +158,18 @@ def _chain_for(conn: sqlite3.Connection, session_id: str) -> list:
 def _set_lock(state_db: str, session_id: str, *, state: str, archived: int,
               platform: str | None) -> None:
     conn = sqlite3.connect(state_db)
-    conn.row_factory = sqlite3.Row  # resolve_chain 需要
+    conn.row_factory = sqlite3.Row  # required by resolve_chain
     try:
         _require_handoff_schema(conn)
         with conn:
             for sid in _chain_for(conn, session_id):
                 if platform is not None:
-                    # 鎖定：記下目前 handoff 目標平台
+                    # Lock: record the current handoff target platform
                     conn.execute(
                         "UPDATE sessions SET handoff_state=?, handoff_platform=?, "
                         "archived=? WHERE id=?", (state, platform, archived, sid))
                 else:
-                    # 解鎖（release）：清掉 handoff_platform（語義＝目前無鎖定平台）
+                    # Unlock (release): clear handoff_platform (semantics = no locked platform)
                     conn.execute(
                         "UPDATE sessions SET handoff_state=?, handoff_platform=NULL, "
                         "archived=? WHERE id=?", (state, archived, sid))
@@ -164,34 +178,37 @@ def _set_lock(state_db: str, session_id: str, *, state: str, archived: int,
 
 
 def mark_handed_off(state_db: str, session_id: str, platform: str = "android") -> None:
-    """傳輸成功後：整條鏈標已交棒 + archived（單一 owner，桌面不再續寫）。"""
+    """After a successful transfer: mark the entire chain as handed off + archived
+    (single owner; the desktop no longer continues writing)."""
     _set_lock(state_db, session_id, state="completed", archived=1, platform=platform)
 
 
 def release_handoff(state_db: str, session_id: str) -> None:
-    """傳輸失敗：整條鏈解鎖（可重試）。"""
+    """On a failed transfer: unlock the entire chain (retryable)."""
     _set_lock(state_db, session_id, state="failed", archived=0, platform=None)
 
 
 def _main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="hermes 接力：桌面側匯出單一對話 bundle")
+    ap = argparse.ArgumentParser(description="hermes handoff: desktop-side export of a single conversation bundle")
     ap.add_argument("--home", default=os.path.expanduser("~/.hermes"),
-                    help="HERMES_HOME（預設 ~/.hermes）")
-    ap.add_argument("--session", required=True, help="要交棒的 session id (UUID)")
-    ap.add_argument("--out", required=True, help="輸出 bundle.json 路徑")
-    ap.add_argument("--device", default="desktop", help="來源 device id")
-    ap.add_argument("--no-memory", action="store_true", help="不含 memory")
+                    help="HERMES_HOME (default ~/.hermes)")
+    ap.add_argument("--session", required=True, help="session id to hand off (UUID)")
+    ap.add_argument("--out", required=True, help="output bundle.json path")
+    ap.add_argument("--device", default="desktop", help="source device id")
+    ap.add_argument("--no-memory", action="store_true", help="exclude memory")
     ap.add_argument("--mark", action="store_true",
-                    help="匯出後立即標記已交棒（測試用；正式應在傳輸確認後）")
+                    help="mark as handed off immediately after export (for testing; in "
+                         "production this should happen after transfer is confirmed)")
     a = ap.parse_args(argv)
 
     bundle = export_for_handoff(a.home, a.session, source_device=a.device,
                                 include_memory=not a.no_memory)
     if bundle is None:
-        print(f"找不到 session: {a.session}", file=sys.stderr)
+        print(f"session not found: {a.session}", file=sys.stderr)
         return 1
-    # 安全（review P2）：bundle 含對話 + memory → 不可在 umask 022 下變 0644 同機可讀。
-    # 寫到同目錄的 0600 暫存檔（mkstemp 預設 0600）再原子 os.replace。
+    # Security (review P2): the bundle contains conversation + memory -> must not become
+    # 0644 (locally readable) under umask 022. Write to a 0600 temp file in the same
+    # directory (mkstemp defaults to 0600), then os.replace atomically.
     out_dir = os.path.dirname(os.path.abspath(a.out)) or "."
     fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".handoff-", suffix=".tmp")
     try:
@@ -205,11 +222,11 @@ def _main(argv=None) -> int:
             pass
         raise
     mem = len(bundle.get("memory", {}))
-    print(f"匯出 OK → {a.out}：鏈 {len(bundle['session_ids'])} session、"
-          f"{len(bundle['messages'])} 訊息、{mem} memory 檔")
+    print(f"export OK -> {a.out}: chain {len(bundle['session_ids'])} session(s), "
+          f"{len(bundle['messages'])} message(s), {mem} memory file(s)")
     if a.mark:
         mark_handed_off(os.path.join(a.home, "state.db"), a.session)
-        print(f"已標記 {a.session} 為已交棒（archived）")
+        print(f"marked {a.session} as handed off (archived)")
     return 0
 
 

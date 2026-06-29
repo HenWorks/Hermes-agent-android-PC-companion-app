@@ -1,9 +1,10 @@
 """
-transport E2E 測試 — 需 PyNaCl(+zeroconf)，用 venv 跑：
+transport E2E tests — requires PyNaCl(+zeroconf), run with a venv:
     /tmp/handoff-venv/bin/python handoff/tests/test_transport_e2e.py
 
-驗證桌面→手機接力傳輸全鏈：互相認證握手 → Box 加密傳 bundle → 手機 import 合併 →
-未配對拒絕 → 錯 server 金鑰失敗 → mDNS 廣告/發現（best-effort）。
+Verifies the full desktop→phone handoff transport chain: mutual-authentication handshake →
+Box-encrypted bundle transfer → phone import/merge → unpaired rejection → wrong server key
+fails → mDNS advertise/discovery (best-effort).
 """
 import os
 import sqlite3
@@ -57,7 +58,7 @@ def run():
     desk_db = os.path.join(desk_home, "state.db")
     phone_db = os.path.join(phone_home, "state.db")
 
-    # 配對：桌面 peers 收手機；（手機端只需 server pubkey，從 QR 拿）
+    # pairing: desktop peers add the phone; (the phone only needs the server pubkey, obtained from the QR)
     desk_peers = hs.PeerStore(os.path.join(tmp, "desk_peers.json"))
     desk_peers.add(phone_id.device_id, bytes(phone_id.public_key))
 
@@ -67,38 +68,38 @@ def run():
         host="127.0.0.1")
     port = server.start(advertise=False)
     try:
-        # 1. 正常拉取（互相認證 + 加密）
+        # 1. normal pull (mutual authentication + encryption)
         bundle = hs.pull_session("127.0.0.1", port, phone_id,
                                  bytes(desk_id.public_key), "SID")
         assert bundle["session_ids"] == ["SID"]
         assert len(bundle["messages"]) == 2
 
-        # 2. import 進手機 + 驗
+        # 2. import into the phone + verify
         st = hc.import_bundle(phone_db, bundle)
         assert st["sessions_added"] == 1 and st["messages_added"] == 2, st
         c = sqlite3.connect(phone_db)
         n = c.execute("SELECT count(*) FROM messages WHERE session_id='SID'").fetchone()[0]
         fts = c.execute("SELECT count(*) FROM messages_fts").fetchone()[0]
         c.close()
-        assert n == 2 and fts == 2, f"import 後 messages={n} fts={fts}"
+        assert n == 2 and fts == 2, f"after import messages={n} fts={fts}"
 
-        # 3. 未配對的 client → 被拒
+        # 3. unpaired client → rejected
         stranger = pr.load_or_create_identity(os.path.join(tmp, "stranger.key"))
         try:
             hs.pull_session("127.0.0.1", port, stranger, bytes(desk_id.public_key), "SID")
-            assert False, "未配對裝置應被拒"
+            assert False, "unpaired device should be rejected"
         except PermissionError:
             pass
 
-        # 4. 配對方但用「錯的 server 公鑰」→ 認證/解密失敗（非正常拿到 bundle）
+        # 4. a paired party but using the "wrong server public key" → authentication/decryption fails (does not normally get the bundle)
         wrong = pr.load_or_create_identity(os.path.join(tmp, "wrong.key"))
         try:
             hs.pull_session("127.0.0.1", port, phone_id, bytes(wrong.public_key), "SID")
-            assert False, "錯 server 公鑰不應成功"
+            assert False, "wrong server public key should not succeed"
         except Exception:
-            pass  # CryptoError / LookupError 皆可接受
+            pass  # CryptoError / LookupError both acceptable
 
-        # 5. owner 鎖：傳輸確認後標記整條鏈
+        # 5. owner lock: after transfer is confirmed, mark the entire chain
         de.mark_handed_off(desk_db, "SID", platform="android")
         c = sqlite3.connect(desk_db)
         arch, state = c.execute(
@@ -108,21 +109,21 @@ def run():
     finally:
         server.stop()
 
-    # 6. _is_lan_ipv4 分類（review P2：QR host 須避開 Tailscale 100.x）
+    # 6. _is_lan_ipv4 classification (review P2: QR host must avoid Tailscale 100.x)
     assert hs._is_lan_ipv4("192.168.1.5")
     assert hs._is_lan_ipv4("10.0.0.9")
     assert hs._is_lan_ipv4("172.16.3.4")
-    assert not hs._is_lan_ipv4("100.116.20.1"), "Tailscale/CGNAT 不算 LAN"
-    assert not hs._is_lan_ipv4("127.0.0.1"), "loopback 不算 LAN"
-    assert not hs._is_lan_ipv4("8.8.8.8"), "公網不算 LAN"
+    assert not hs._is_lan_ipv4("100.116.20.1"), "Tailscale/CGNAT does not count as LAN"
+    assert not hs._is_lan_ipv4("127.0.0.1"), "loopback does not count as LAN"
+    assert not hs._is_lan_ipv4("8.8.8.8"), "public internet does not count as LAN"
     assert not hs._is_lan_ipv4("not-an-ip")
-    # _local_ip 永不回 Tailscale 100.x（除非真的只剩它，屬退而求其次）
-    assert hs._local_ip(), "_local_ip 應回傳非空位址"
+    # _local_ip never returns Tailscale 100.x (unless it's truly the only one left, as a last resort)
+    assert hs._local_ip(), "_local_ip should return a non-empty address"
 
-    # 7. mDNS 廣告/發現（best-effort：multicast 不可用環境略過）
+    # 7. mDNS advertise/discovery (best-effort: skipped in environments where multicast is unavailable)
     mdns = _try_mdns(desk_id)
-    print(f"✅ 全部通過：握手認證/加密傳輸/import/未配對拒絕/錯金鑰拒絕/owner鎖 · "
-          f"LAN-IP 分類 · mDNS={mdns}")
+    print(f"✅ all passed: handshake auth/encrypted transfer/import/unpaired rejection/wrong-key rejection/owner lock · "
+          f"LAN-IP classification · mDNS={mdns}")
     return 0
 
 
@@ -152,9 +153,9 @@ def _try_mdns(desk_id) -> str:
             time.sleep(0.1)
         ok = any(desk_id.device_id in v for v in found.values())
         zc.close(); srv.stop()
-        return "OK（發現自己廣告的服務）" if ok else "略過/未發現（環境無 multicast）"
+        return "OK (discovered its own advertised service)" if ok else "skipped/not found (environment has no multicast)"
     except Exception as e:  # noqa: BLE001
-        return f"略過（{type(e).__name__}）"
+        return f"skipped ({type(e).__name__})"
 
 
 if __name__ == "__main__":

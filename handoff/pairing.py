@@ -1,17 +1,24 @@
 """
-pairing — hermes 接力的裝置身分、配對 QR、NaCl Box 端到端加密（#2）。
+pairing — device identity, pairing QR, and NaCl Box end-to-end encryption for hermes
+handoff (#2).
 
-桌面端用 PyNaCl；手機端（Kotlin）用 lazysodium-android，底層同一個 libsodium →
-Box（Curve25519 + XSalsa20-Poly1305）二進位互通。本模組是桌面側 + 規格參照。
+The desktop side uses PyNaCl; the phone side (Kotlin) uses lazysodium-android — both back
+onto the same libsodium -> Box (Curve25519 + XSalsa20-Poly1305) is binary-interoperable.
+This module is the desktop side + the spec reference.
 
-模型：
-- 每台一組長期 Curve25519 金鑰對（私鑰存 0600 檔；公鑰用於配對 + 加密）。
-- device_id = 公鑰前 8 bytes 的 hex（穩定、可由公鑰驗證，不可偽造）。
-- 配對：桌面顯示 QR(JSON: v/did/pk/host/port)；手機掃 → 存桌面 pubkey+did。
-  反向把手機 pubkey 給桌面在傳輸握手時帶上（見 #4），雙方互存 → 配對完成。
-- 之後通訊：Box(my_sk, peer_pk) 認證加密（任何竄改/錯金鑰都會解密失敗）。
+Model:
+- One long-term Curve25519 key pair per device (private key stored in a 0600 file; public
+  key used for pairing + encryption).
+- device_id = hex of the public key's first 8 bytes (stable, verifiable from the public
+  key, unforgeable).
+- Pairing: the desktop shows a QR (JSON: v/did/pk/host/port); the phone scans it ->
+  stores the desktop pubkey+did. The phone's pubkey is sent back to the desktop during
+  the transfer handshake (see #4); both sides store each other's -> pairing complete.
+- Subsequent communication: Box(my_sk, peer_pk) authenticated encryption (any tampering /
+  wrong key causes decryption to fail).
 
-🔴 私鑰永不離開本機、永不入 bundle/QR；QR 只含「公鑰」。
+🔴 The private key never leaves the machine and never enters the bundle/QR; the QR
+contains only the "public key".
 """
 from __future__ import annotations
 
@@ -23,8 +30,8 @@ from dataclasses import dataclass
 import nacl.public
 import nacl.utils
 
-QR_SCHEMA = 1          # 純配對 QR（信任建立，無 session）
-HANDOFF_QR_SCHEMA = 2  # 接力 QR：配對資訊 + 指定 session_id（首掃同時完成配對 + 選取）
+QR_SCHEMA = 1          # pure pairing QR (trust establishment, no session)
+HANDOFF_QR_SCHEMA = 2  # handoff QR: pairing info + a specified session_id (first scan does pairing + selection at once)
 
 
 def _b64e(b: bytes) -> str:
@@ -37,7 +44,7 @@ def _b64d(s: str) -> bytes:
 
 
 def device_id_for(pubkey: bytes) -> str:
-    """由公鑰推出穩定 device_id（前 8 bytes hex）。"""
+    """Derive a stable device_id from the public key (first 8 bytes, hex)."""
     return pubkey[:8].hex()
 
 
@@ -56,7 +63,8 @@ class DeviceIdentity:
 
 
 def load_or_create_identity(key_path: str) -> DeviceIdentity:
-    """從 0600 檔載入長期私鑰；不存在則產生並以 0600 原子寫出。"""
+    """Load the long-term private key from a 0600 file; if absent, generate one and write
+    it out atomically as 0600."""
     if os.path.isfile(key_path):
         with open(key_path, "rb") as f:
             sk = nacl.public.PrivateKey(f.read())
@@ -64,7 +72,7 @@ def load_or_create_identity(key_path: str) -> DeviceIdentity:
     sk = nacl.public.PrivateKey.generate()
     d = os.path.dirname(os.path.abspath(key_path)) or "."
     os.makedirs(d, exist_ok=True)
-    # 0600 原子寫
+    # 0600 atomic write
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".idkey-")
     try:
@@ -80,7 +88,7 @@ def load_or_create_identity(key_path: str) -> DeviceIdentity:
     return DeviceIdentity(sk, sk.public_key)
 
 
-# ── 配對 QR ────────────────────────────────────────────────────────────────
+# ── Pairing QR ────────────────────────────────────────────────────────────────
 
 @dataclass
 class PeerInfo:
@@ -88,11 +96,12 @@ class PeerInfo:
     public_key: bytes
     host: str
     port: int
-    session_id: str | None = None  # 僅接力 QR(v2) 帶；純配對 QR(v1) 為 None
+    session_id: str | None = None  # only carried by handoff QR (v2); None for pure pairing QR (v1)
 
 
 def build_pair_qr(identity: DeviceIdentity, host: str, port: int) -> str:
-    """產生純配對 QR 內容（v1，信任建立用）。只含公鑰，不含私鑰。"""
+    """Produce pure pairing QR content (v1, for trust establishment). Contains only the
+    public key, never the private key."""
     return json.dumps({
         "v": QR_SCHEMA,
         "did": identity.device_id,
@@ -104,10 +113,11 @@ def build_pair_qr(identity: DeviceIdentity, host: str, port: int) -> str:
 
 def build_handoff_qr(identity: DeviceIdentity, host: str, port: int,
                      session_id: str) -> str:
-    """產生接力 QR 內容（v2）：配對資訊 + 指定 session_id。手機首掃同時完成配對 +
-    選定要接收的 session。只含公鑰，不含私鑰。"""
+    """Produce handoff QR content (v2): pairing info + a specified session_id. The phone's
+    first scan completes pairing + selects the session to receive at once. Contains only
+    the public key, never the private key."""
     if not session_id:
-        raise ValueError("handoff QR 需指定 session_id")
+        raise ValueError("handoff QR requires a session_id")
     return json.dumps({
         "v": HANDOFF_QR_SCHEMA,
         "did": identity.device_id,
@@ -119,40 +129,44 @@ def build_handoff_qr(identity: DeviceIdentity, host: str, port: int,
 
 
 def parse_qr(s: str) -> PeerInfo:
-    """解析配對(v1)或接力(v2) QR；驗證 device_id 與公鑰一致（防偽造）。
-    v2 必須帶 sid，回傳的 PeerInfo.session_id 即為要接收的 session。"""
+    """Parse a pairing (v1) or handoff (v2) QR; verify the device_id matches the public
+    key (anti-forgery). v2 must carry sid, and the returned PeerInfo.session_id is the
+    session to receive."""
     d = json.loads(s)
     v = d.get("v")
     if v not in (QR_SCHEMA, HANDOFF_QR_SCHEMA):
         raise ValueError(f"unsupported QR schema: {v}")
     pk = _b64d(d["pk"])
     if len(pk) != 32:
-        raise ValueError(f"公鑰長度錯誤：{len(pk)}（Curve25519 須 32 bytes）")
+        raise ValueError(f"wrong public key length: {len(pk)} (Curve25519 must be 32 bytes)")
     if device_id_for(pk) != d["did"]:
-        raise ValueError("device_id 與公鑰不一致（QR 可能被竄改）")
+        raise ValueError("device_id does not match public key (QR may have been tampered with)")
     sid = None
     if v == HANDOFF_QR_SCHEMA:
         sid = d.get("sid")
         if not sid:
-            raise ValueError("接力 QR(v2) 缺少 sid")
+            raise ValueError("handoff QR (v2) is missing sid")
     return PeerInfo(device_id=d["did"], public_key=pk,
                     host=d["host"], port=int(d["port"]), session_id=sid)
 
 
-# 向後相容別名：舊呼叫端/測試用 parse_pair_qr，現統一走 parse_qr（仍接受 v1）。
+# Backward-compatibility alias: older callers/tests use parse_pair_qr; now unified to
+# parse_qr (still accepts v1).
 parse_pair_qr = parse_qr
 
 
-# ── NaCl Box 端到端加密 ─────────────────────────────────────────────────────
+# ── NaCl Box end-to-end encryption ─────────────────────────────────────────────────────
 
 def box_encrypt(my_sk: nacl.public.PrivateKey, peer_pk: bytes, plaintext: bytes) -> bytes:
-    """Box 認證加密；回傳 nonce(24) + ciphertext。peer 用對應金鑰才能解 + 驗真。"""
+    """Box authenticated encryption; returns nonce(24) + ciphertext. Only the peer with the
+    matching key can decrypt + verify authenticity."""
     box = nacl.public.Box(my_sk, nacl.public.PublicKey(peer_pk))
     nonce = nacl.utils.random(nacl.public.Box.NONCE_SIZE)
     return bytes(box.encrypt(plaintext, nonce))  # EncryptedMessage = nonce||ct
 
 
 def box_decrypt(my_sk: nacl.public.PrivateKey, peer_pk: bytes, blob: bytes) -> bytes:
-    """Box 解密 + 驗真；竄改或錯金鑰會丟 nacl.exceptions.CryptoError。"""
+    """Box decryption + authentication; tampering or a wrong key raises
+    nacl.exceptions.CryptoError."""
     box = nacl.public.Box(my_sk, nacl.public.PublicKey(peer_pk))
     return box.decrypt(blob)
