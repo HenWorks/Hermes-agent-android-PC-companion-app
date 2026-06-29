@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Hermes Mesh — 桌面一鍵啟動（北極星：PC 端最小化）。
 #
-#   ./mesh-start.sh              啟動 broker（前景，顯示配對 QR）
-#   ./mesh-start.sh --autostart  安裝開機自啟（macOS launchd / Linux systemd --user）後啟動
-#   ./mesh-start.sh --stop-autostart  移除開機自啟
+#   ./mesh-start.sh              前景啟動 broker（顯示配對 QR，Ctrl+C 結束）
+#   ./mesh-start.sh --tailscale  前景啟動，綁 Tailscale IP（跨網路）
+#
+#   背景常駐開關（開機自啟 + 背景常駐，macOS launchd / Linux systemd --user）：
+#   ./mesh-start.sh daemon on      開啟背景常駐（安裝自啟並立即在背景跑）
+#   ./mesh-start.sh daemon off     關閉背景常駐（停止並移除自啟）
+#   ./mesh-start.sh daemon status  查看背景常駐狀態（已安裝/執行中？）
+#   （舊旗標 --autostart / --stop-autostart 仍相容，等同 daemon on / off）
 #
 # 自動建立隔離 venv（~/.hermes/mesh/venv）並安裝相依（PyNaCl/zeroconf/qrcode），不污染系統 python。
 # 之後手機 app「電腦協作」掃 QR / 貼配對碼即可連結。broker 綁 LAN IP（絕不 0.0.0.0）。
@@ -103,10 +108,44 @@ stop_autostart() {
   esac
 }
 
+daemon_status() {
+  case "$(uname -s)" in
+    Darwin)
+      local plist="$HOME/Library/LaunchAgents/$LABEL.plist"
+      if [ -f "$plist" ]; then
+        if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+          log "背景常駐：✅ 開啟（已安裝自啟、執行中）。log：~/.hermes/mesh/broker.log"
+        else
+          log "背景常駐：⚠️ 已安裝自啟但目前未執行（試 ./mesh-start.sh daemon on 重啟）。"
+        fi
+      else
+        log "背景常駐：⭕ 關閉（未安裝自啟）。前景啟動：./mesh-start.sh"
+      fi ;;
+    *)
+      if systemctl --user is-enabled "$LABEL.service" >/dev/null 2>&1; then
+        if systemctl --user is-active "$LABEL.service" >/dev/null 2>&1; then
+          log "背景常駐：✅ 開啟（已啟用、執行中）。"
+        else
+          log "背景常駐：⚠️ 已啟用但目前未執行（systemctl --user status $LABEL.service）。"
+        fi
+      else
+        log "背景常駐：⭕ 關閉（未啟用）。前景啟動：./mesh-start.sh"
+      fi ;;
+  esac
+}
+
+# 背景常駐開關：daemon on/off/status（清楚的開關介面，取代裸 --autostart）
 case "${1:-}" in
-  --autostart) ensure_venv; install_autostart ;;
-  --stop-autostart) stop_autostart ;;
+  daemon)
+    case "${2:-status}" in
+      on)     ensure_venv; install_autostart ;;
+      off)    stop_autostart ;;
+      status) daemon_status ;;
+      *) err "用法：daemon on | off | status"; exit 1 ;;
+    esac ;;
+  --autostart) ensure_venv; install_autostart ;;   # 舊旗標相容 = daemon on
+  --stop-autostart) stop_autostart ;;              # 舊旗標相容 = daemon off
   --tailscale) ensure_venv; USE_TAILSCALE=1 run_broker ;;
   "" ) ensure_venv; run_broker ;;
-  *) err "未知參數：$1（可用：--tailscale / --autostart / --stop-autostart / 無參數=LAN）"; exit 1 ;;
+  *) err "未知參數：$1（可用：無參數=前景LAN / --tailscale / daemon on|off|status）"; exit 1 ;;
 esac
