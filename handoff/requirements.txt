@@ -1,0 +1,4 @@
+# hermes 接力 — 桌面 plugin 執行期相依
+# （手機端用 lazysodium-android + Android NSD，不在此）
+PyNaCl>=1.5        # NaCl box e2e 加密（與 Android lazysodium 同底層 libsodium、互通）
+zeroconf>=0.130    # mDNS 服務廣告（手機用 Android NSD 發現）
