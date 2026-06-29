@@ -32,44 +32,50 @@ def _icon_image():
 
 
 def main() -> int:
-    # pystray import first so a missing-display / missing-backend error surfaces
-    # before we start the broker (lets the caller fall back to CLI cleanly).
+    # pystray import first so a missing module surfaces before we start the broker.
     import pystray
 
     broker = mb.serve()
-    broker.open_pairing(300)
+    # From here the broker owns the fixed port. If the tray fails to come up (no display
+    # backend, Icon/run() raises), stop the broker before propagating, so the caller's CLI
+    # fallback isn't blocked by the still-bound port 51379.
     try:
-        web_host, web_port = cw.serve_web(broker)
-        url = f"http://{web_host}:{web_port}/"
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001 — console is optional; tray still works without it
-        url = None
-
-    bind = f"{broker.host}:{broker.port}"
-    print(t("started", id=broker.identity.device_id, bind=bind))
-
-    def on_open(icon, item):
-        if url:
-            webbrowser.open(url)
-
-    def on_reopen(icon, item):
         broker.open_pairing(300)
-
-    def on_quit(icon, item):
         try:
-            broker.stop()
-        finally:
-            icon.stop()
+            web_host, web_port = cw.serve_web(broker)
+            url = f"http://{web_host}:{web_port}/"
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — console is optional; tray still works without it
+            url = None
 
-    items = [pystray.MenuItem(t("tray_running", bind=bind), None, enabled=False)]
-    if url:
-        items.append(pystray.MenuItem(t("tray_open_console"), on_open, default=True))
-    items.append(pystray.MenuItem(t("tray_reopen_pairing"), on_reopen))
-    items.append(pystray.MenuItem(t("tray_quit"), on_quit))
+        bind = f"{broker.host}:{broker.port}"
+        print(t("started", id=broker.identity.device_id, bind=bind))
 
-    icon = pystray.Icon("hermes-companion", _icon_image(), t("tray_title"), pystray.Menu(*items))
-    icon.run()   # blocks on the main thread until Quit
-    return 0
+        def on_open(icon, item):
+            if url:
+                webbrowser.open(url)
+
+        def on_reopen(icon, item):
+            broker.open_pairing(300)
+
+        def on_quit(icon, item):
+            try:
+                broker.stop()
+            finally:
+                icon.stop()
+
+        items = [pystray.MenuItem(t("tray_running", bind=bind), None, enabled=False)]
+        if url:
+            items.append(pystray.MenuItem(t("tray_open_console"), on_open, default=True))
+        items.append(pystray.MenuItem(t("tray_reopen_pairing"), on_reopen))
+        items.append(pystray.MenuItem(t("tray_quit"), on_quit))
+
+        icon = pystray.Icon("hermes-companion", _icon_image(), t("tray_title"), pystray.Menu(*items))
+        icon.run()   # blocks on the main thread until Quit (on_quit already stopped the broker)
+        return 0
+    except BaseException:
+        broker.stop()   # release the port so the caller can fall back to CLI cleanly
+        raise
 
 
 if __name__ == "__main__":

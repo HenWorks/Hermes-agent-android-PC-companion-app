@@ -61,7 +61,8 @@ def run():
         # pair a phone + end-to-end pull
         phone = pr.load_or_create_identity(os.path.join(home, "phone.key"))
         srv.peers.add(phone.device_id, bytes(phone.public_key))
-        bundle = hs.pull_session("127.0.0.1", srv.port, phone,
+        # the server binds _local_ip() (never 0.0.0.0/127.0.0.1) → connect to its actual host
+        bundle = hs.pull_session(srv.host, srv.port, phone,
                                  bytes(srv.identity.public_key), "SID")
         assert bundle["session_ids"] == ["SID"]
         assert bundle["memory"] == {"MEMORY.md": "- m1\n"}, "serve should carry memory"
