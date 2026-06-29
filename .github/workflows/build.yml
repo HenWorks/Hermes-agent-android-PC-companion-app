@@ -1,0 +1,83 @@
+name: build
+
+# Builds a standalone Hermes companion binary for macOS, Windows and Linux.
+# - On every push to main / PR: build all three and upload as workflow artifacts (smoke test).
+# - On a version tag (v*): also attach the binaries to a GitHub Release for download.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for the release job to upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: hermes-companion-macos
+          - os: windows-latest
+            asset: hermes-companion-windows
+          - os: ubuntu-latest
+            asset: hermes-companion-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller "PyNaCl>=1.5" "zeroconf>=0.130" "qrcode>=7" "pillow>=9"
+
+      - name: Build binary
+        run: pyinstaller --clean --noconfirm hermes-companion.spec
+
+      - name: Smoke test (Linux/macOS — binary starts and exits cleanly)
+        if: runner.os != 'Windows'
+        run: |
+          # Run for a few seconds, then SIGINT. Exit 0 (clean shutdown) or 130 (SIGINT) are OK.
+          ( ./dist/hermes-companion & echo $! > /tmp/pid ) || true
+          sleep 6
+          kill -INT "$(cat /tmp/pid)" 2>/dev/null || true
+          echo "started and stopped"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package per-OS archives
+        run: |
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            (cd "$d" && zip -r "../${name}.zip" .)
+          done
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          body: |
+            Standalone Hermes companion binaries (no Python needed).
+            Download the archive for your OS, unzip, and run `hermes-companion`.
+            macOS/Windows are unsigned — first run may need: macOS right-click → Open;
+            Windows "More info" → "Run anyway".

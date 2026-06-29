@@ -1,5 +1,7 @@
 # Hermes Companion (PC side)
 
+**English** | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md)
+
 The desktop companion for the **Hermes‑agent Android** app. It lets your phone and
 your computer share one Hermes brain over your own network — securely, with no cloud
 in between.
@@ -15,9 +17,19 @@ Two capabilities, one trust domain (pair once, both work):
 
 > This is the **PC half**. The phone half is the Hermes‑agent Android app.
 
-## Install
+## Download
 
-As a Hermes plugin (recommended — one line):
+Prebuilt standalone binaries (no Python needed) are attached to each
+[Release](https://github.com/HenWorks/Hermes-agent-android-PC-companion-app/releases) —
+download the archive for your OS, unzip, and run `hermes-companion`. It starts the
+broker and opens the local browser console (the GUI) automatically.
+
+> macOS / Windows builds are unsigned. First run: macOS → right‑click → **Open**;
+> Windows → **More info** → **Run anyway**.
+
+## Install (from source)
+
+As a Hermes plugin (one line):
 
 ```bash
 hermes plugins install HenWorks/Hermes-agent-android-PC-companion-app
@@ -29,7 +41,14 @@ Or run it directly from a clone:
 git clone https://github.com/HenWorks/Hermes-agent-android-PC-companion-app
 cd Hermes-agent-android-PC-companion-app
 ./handoff/mesh-start.sh          # creates an isolated venv, installs deps, prints the pairing QR
-# ./handoff/mesh-start.sh --autostart    # also install login/boot autostart (macOS launchd / Linux systemd --user)
+```
+
+Background daemon (start at boot, run in background):
+
+```bash
+./handoff/mesh-start.sh daemon on       # turn on
+./handoff/mesh-start.sh daemon status   # check
+./handoff/mesh-start.sh daemon off      # turn off
 ```
 
 Then in the phone app: **Run on Computer** (or **Settings → Desktop Handoff**) → scan the QR.
@@ -47,7 +66,7 @@ The whole point of open‑sourcing this is that you can **audit** it:
 - **Secrets never enter a bundle.** Handoff exports read only `state.db` + `memories/`;
   `auth.json` / `.env` are never touched, and `memories/` symlinks that escape the folder
   are refused (see `handoff/tests/test_desktop_export.py`).
-- **Never binds to `0.0.0.0`.** The broker binds your LAN/Tailscale IP only.
+- **Never binds to `0.0.0.0`.** The broker binds your LAN / Tailscale IP only.
 
 Security rests on the keys, not on the protocol being secret — so publishing it costs
 nothing and lets you verify the claims above.
@@ -63,7 +82,8 @@ handoff/
   desktop_export.py  # export a conversation (read‑only, secrets‑safe)
   handoff_core.py    # the shared merge core (session upsert + message dedup + memory union)
   __init__.py        # Hermes plugin entry (register)
-  mesh-start.sh      # one‑command start + optional autostart
+  mesh-start.sh      # one‑command start + daemon on/off/status
+companion.py         # standalone entry (used by the packaged binary)
 ```
 
 ## License
