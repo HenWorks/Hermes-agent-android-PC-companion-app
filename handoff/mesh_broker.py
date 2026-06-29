@@ -42,6 +42,7 @@ import pairing as pr
 import handoff_server as hs
 import desktop_export as de   # handoff: export a session into an encryptable transport bundle
 import handoff_core as hc      # reverse sync (#22): phone uploads bundle → import_all idempotently merges into PC
+from i18n import t            # i18n for user-facing CLI output (English fallback)
 
 SERVICE_TYPE = "_hermes-mesh._tcp.local."
 PROTO = 1
@@ -464,25 +465,24 @@ def main(argv=None) -> int:
 
     broker = serve(a.home, host=a.host, port=a.port)
     broker.open_pairing(300)  # open a 5-minute pairing window at startup, so the phone can complete reverse pairing after scanning the QR
-    print(f"[companion] device_id={broker.identity.device_id} bind={broker.host}:{broker.port}"
-          f" (collaboration + handoff; mDNS advertising, worker on standby, pairing window 5 minutes)")
+    print(t("started", id=broker.identity.device_id, bind=f"{broker.host}:{broker.port}"))
     # local browser console (North Star: zero terminal on PC) — bound to 127.0.0.1 for the local browser only, opened cross-platform via webbrowser.
     try:
         from companion_web import serve_web
         web_host, web_port = serve_web(broker)
         url = f"http://{web_host}:{web_port}/"
-        print(f"Console: {url} (opening the browser; scan the QR on the page to connect)")
+        print(t("console", url=url))
         import webbrowser
         webbrowser.open(url)
     except Exception as e:  # noqa: BLE001 — a console failure doesn't affect the broker itself, fall back to the terminal QR
-        print(f"(browser console failed to start: {e}; using the terminal QR below instead)")
+        print(t("console_fail", err=e))
 
     # terminal text / ASCII QR (fallback: no GUI / over SSH)
     if a.session:
-        print(f"Handoff QR (session={a.session}):")
+        print(t("handoff_qr", session=a.session))
         qr = broker.handoff_qr(a.session)
     else:
-        print("Pairing QR (text; or just use the image in the browser console):")
+        print(t("pair_qr"))
         qr = broker.pair_qr()
     print(qr)
     if qrcode is not None:
@@ -492,13 +492,13 @@ def main(argv=None) -> int:
             q.print_ascii(invert=True)
         except Exception:  # noqa: BLE001
             pass
-    print("companion running, Ctrl+C to quit.")
+    print(t("running"))
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
         broker.stop()
-        print("\nStopped.")
+        print("\n" + t("stopped"))
     return 0
 
 

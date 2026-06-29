@@ -7,9 +7,9 @@ block_cipher = None
 
 hidden = [
     "mesh_broker", "companion_web", "pairing", "handoff_server",
-    "desktop_export", "handoff_core",
+    "desktop_export", "handoff_core", "companion_app", "i18n",
     "nacl", "nacl.public", "nacl.signing", "nacl.bindings", "nacl.encoding",
-    "zeroconf", "qrcode", "PIL", "PIL.Image",
+    "zeroconf", "qrcode", "PIL", "PIL.Image", "PIL.ImageDraw", "pystray",
 ]
 
 a = Analysis(
