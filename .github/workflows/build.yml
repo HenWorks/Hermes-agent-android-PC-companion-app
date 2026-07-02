@@ -46,12 +46,16 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --clean --noconfirm hermes-companion.spec
 
-      # ── macOS: zip the .app with ditto (preserves bundle + perms + symlinks) ──
-      - name: Package macOS app
+      # ── macOS: build a .dmg (drag-to-Applications) — dmg preserves the bundle +
+      #    perms, and running from /Applications avoids Gatekeeper App Translocation
+      #    (the cause of the "-47 can't open" on re-install). ──
+      - name: Package macOS .dmg
         if: runner.os == 'macOS'
         run: |
-          cd dist
-          ditto -c -k --keepParent "Hermes Companion.app" "../${{ matrix.asset }}.zip"
+          mkdir -p dmgroot
+          cp -R "dist/Hermes Companion.app" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Hermes Companion" -srcfolder dmgroot -ov -format UDZO "${{ matrix.asset }}.dmg"
 
       # ── Windows: zip the exe ──
       - name: Package Windows exe
@@ -85,7 +89,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}.zip
+          path: |
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.dmg
           if-no-files-found: error
 
   release:
@@ -96,23 +102,25 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Collect zips
+      - name: Collect assets
         run: |
           mkdir -p out
-          find artifacts -name '*.zip' -exec cp {} out/ \;
+          find artifacts \( -name '*.zip' -o -name '*.dmg' \) -exec cp {} out/ \;
           ls -la out
       - uses: softprops/action-gh-release@v2
         with:
-          files: out/*.zip
+          files: out/*
           body: |
             One-click Hermes companion apps (no Python needed).
 
-            - **macOS** — unzip, then double-click **Hermes Companion.app**. First launch:
+            - **macOS** — open **hermes-companion-macos.dmg**, drag **Hermes Companion**
+              to **Applications**, then open it from Applications. First launch:
               right-click → **Open** (unsigned app; one-time Gatekeeper approval).
+              *To reinstall: quit the running one first (menu-bar icon → Quit).*
             - **Windows** — unzip, double-click **hermes-companion.exe**. If SmartScreen
               appears: **More info** → **Run anyway**.
             - **Linux** — unzip, then run **hermes-companion.AppImage**
               (`chmod +x` if your browser cleared the executable bit).
 
             The app starts the broker and opens the local browser console automatically;
-            scan the QR with the Hermes phone app to connect.
+            scan the QR with the Hermes phone app to connect. Runs in the menu bar / tray.

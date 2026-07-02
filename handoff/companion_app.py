@@ -31,11 +31,27 @@ def _icon_image():
     return img
 
 
+def _url_file() -> str:
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(home, "mesh", "console.url")
+
+
 def main() -> int:
     # pystray import first so a missing module surfaces before we start the broker.
     import pystray
 
-    broker = mb.serve()
+    # Single instance: the broker owns a fixed port, so a second launch can't bind it.
+    # Rather than crash, detect the already-running instance and just reopen its console.
+    try:
+        broker = mb.serve()
+    except OSError:
+        try:
+            with open(_url_file(), encoding="utf-8") as f:
+                webbrowser.open(f.read().strip())
+        except Exception:  # noqa: BLE001 — no saved URL → nothing to reopen
+            pass
+        print("Hermes Companion is already running.")
+        return 0
     # From here the broker owns the fixed port. If the tray fails to come up (no display
     # backend, Icon/run() raises), stop the broker before propagating, so the caller's CLI
     # fallback isn't blocked by the still-bound port 51379.
@@ -44,6 +60,13 @@ def main() -> int:
         try:
             web_host, web_port = cw.serve_web(broker)
             url = f"http://{web_host}:{web_port}/"
+            # Save so a second launch can reopen this console instead of failing.
+            try:
+                os.makedirs(os.path.dirname(_url_file()), exist_ok=True)
+                with open(_url_file(), "w", encoding="utf-8") as f:
+                    f.write(url)
+            except OSError:
+                pass
             webbrowser.open(url)
         except Exception:  # noqa: BLE001 — console is optional; tray still works without it
             url = None
