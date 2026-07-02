@@ -13,8 +13,35 @@ from __future__ import annotations
 
 import locale as _locale
 import os
+import sys
 
 SUPPORTED = ("en", "zh-TW", "zh-CN", "ja", "ko", "es")
+
+
+def _os_language() -> str:
+    """Query the OS's UI language when no LANG env is set (packaged .app / .exe).
+
+    macOS   → `defaults read -g AppleLanguages` (e.g. "zh-Hant-CN").
+    Windows → GetUserDefaultUILanguage() → locale name (e.g. "zh_TW").
+    Returns "" if it can't be determined (caller falls back further).
+    """
+    try:
+        if sys.platform == "darwin":
+            import re
+            import subprocess
+            out = subprocess.run(
+                ["/usr/bin/defaults", "read", "-g", "AppleLanguages"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            m = re.search(r'"?([A-Za-z]{2}[\w-]*)"?', out)  # first language tag
+            return m.group(1) if m else ""
+        if sys.platform.startswith("win"):
+            import ctypes
+            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()  # type: ignore[attr-defined]
+            return _locale.windows_locale.get(lcid, "")
+    except Exception:  # noqa: BLE001 — best-effort; any failure → fall through
+        pass
+    return ""
 
 
 def _detect() -> str:
@@ -24,6 +51,10 @@ def _detect() -> str:
         if v:
             raw = v
             break
+    if not raw:
+        # Finder/Explorer-launched apps (the packaged .app / .exe) inherit no LANG
+        # env, so fall back to the OS's own UI-language setting.
+        raw = _os_language()
     if not raw:
         try:
             raw = (_locale.getlocale()[0] or "") or (_locale.getdefaultlocale()[0] or "")
