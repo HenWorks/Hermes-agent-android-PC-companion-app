@@ -11,6 +11,7 @@ should fall back to the console CLI.
 """
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import webbrowser
@@ -42,9 +43,13 @@ def main() -> int:
 
     # Single instance: the broker owns a fixed port, so a second launch can't bind it.
     # Rather than crash, detect the already-running instance and just reopen its console.
+    # Narrow to EADDRINUSE only — any other startup OSError (e.g. EADDRNOTAVAIL, a real
+    # bind/network failure) must propagate, not be masked as "already running".
     try:
         broker = mb.serve()
-    except OSError:
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
         try:
             with open(_url_file(), encoding="utf-8") as f:
                 webbrowser.open(f.read().strip())
