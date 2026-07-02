@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Hermes Companion
+Comment=Desktop companion for the Hermes-agent Android app
+Exec=hermes-companion
+Icon=hermes-companion
+Categories=Utility;Network;
+Terminal=true

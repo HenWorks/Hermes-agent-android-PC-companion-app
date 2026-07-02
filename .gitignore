@@ -7,3 +7,9 @@ venv/
 *.db
 *.sock
 .DS_Store
+
+# PyInstaller local build
+dist/
+build/
+AppDir/
+*.spec.bak

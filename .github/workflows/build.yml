@@ -1,8 +1,12 @@
 name: build
 
-# Builds a standalone Hermes companion binary for macOS, Windows and Linux.
-# - On every push to main / PR: build all three and upload as workflow artifacts (smoke test).
-# - On a version tag (v*): also attach the binaries to a GitHub Release for download.
+# Builds a one-click Hermes companion app for macOS, Windows and Linux.
+#   macOS  → Hermes Companion.app  (menu-bar agent, double-click to run)
+#   Windows→ hermes-companion.exe  (double-click to run)
+#   Linux  → hermes-companion.AppImage (double-click to run)
+# Each build job zips its own artifact IN-PLACE so Unix exec bits and the .app
+# bundle structure survive (actions/upload-artifact strips file permissions).
+# On a version tag (v*), the zips are attached to a GitHub Release.
 
 on:
   push:
@@ -12,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed for the release job to upload assets
+  contents: write
 
 jobs:
   build:
@@ -39,22 +43,49 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller "PyNaCl>=1.5" "zeroconf>=0.130" "qrcode>=7" "pillow>=9" "pystray>=0.19"
 
-      - name: Build binary
+      - name: Build with PyInstaller
         run: pyinstaller --clean --noconfirm hermes-companion.spec
 
-      - name: Smoke test (Linux/macOS — binary starts and exits cleanly)
-        if: runner.os != 'Windows'
+      # ── macOS: zip the .app with ditto (preserves bundle + perms + symlinks) ──
+      - name: Package macOS app
+        if: runner.os == 'macOS'
         run: |
-          # Run for a few seconds, then SIGINT. Exit 0 (clean shutdown) or 130 (SIGINT) are OK.
-          ( ./dist/hermes-companion & echo $! > /tmp/pid ) || true
-          sleep 6
-          kill -INT "$(cat /tmp/pid)" 2>/dev/null || true
-          echo "started and stopped"
+          cd dist
+          ditto -c -k --keepParent "Hermes Companion.app" "../${{ matrix.asset }}.zip"
+
+      # ── Windows: zip the exe ──
+      - name: Package Windows exe
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/hermes-companion.exe -DestinationPath ${{ matrix.asset }}.zip
+        shell: pwsh
+
+      # ── Linux: wrap the binary into an AppImage, then zip (zip keeps +x) ──
+      - name: Package Linux AppImage
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          mkdir -p AppDir/usr/bin
+          cp dist/hermes-companion AppDir/usr/bin/hermes-companion
+          chmod +x AppDir/usr/bin/hermes-companion
+          cp packaging/hermes-companion.desktop AppDir/hermes-companion.desktop
+          python -c "from PIL import Image,ImageDraw; img=Image.new('RGBA',(256,256),(0,0,0,0)); d=ImageDraw.Draw(img); d.ellipse((24,24,232,232),fill=(59,130,207,255)); d.ellipse((88,88,168,168),fill=(255,255,255,255)); img.save('AppDir/hermes-companion.png')"
+          cp AppDir/hermes-companion.png AppDir/.DirIcon
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/hermes-companion" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir hermes-companion.AppImage
+          chmod +x hermes-companion.AppImage
+          zip -y ${{ matrix.asset }}.zip hermes-companion.AppImage
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/*
+          path: ${{ matrix.asset }}.zip
           if-no-files-found: error
 
   release:
@@ -65,19 +96,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Package per-OS archives
+      - name: Collect zips
         run: |
-          cd artifacts
-          for d in */; do
-            name="${d%/}"
-            (cd "$d" && zip -r "../${name}.zip" .)
-          done
-          ls -la
+          mkdir -p out
+          find artifacts -name '*.zip' -exec cp {} out/ \;
+          ls -la out
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: out/*.zip
           body: |
-            Standalone Hermes companion binaries (no Python needed).
-            Download the archive for your OS, unzip, and run `hermes-companion`.
-            macOS/Windows are unsigned — first run may need: macOS right-click → Open;
-            Windows "More info" → "Run anyway".
+            One-click Hermes companion apps (no Python needed).
+
+            - **macOS** — unzip, then double-click **Hermes Companion.app**. First launch:
+              right-click → **Open** (unsigned app; one-time Gatekeeper approval).
+            - **Windows** — unzip, double-click **hermes-companion.exe**. If SmartScreen
+              appears: **More info** → **Run anyway**.
+            - **Linux** — unzip, then run **hermes-companion.AppImage**
+              (`chmod +x` if your browser cleared the executable bit).
+
+            The app starts the broker and opens the local browser console automatically;
+            scan the QR with the Hermes phone app to connect.
