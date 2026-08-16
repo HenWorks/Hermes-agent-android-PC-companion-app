@@ -137,6 +137,21 @@ class MeshStore:
         return [{"id": r[0], "ref": r[1], "ok": bool(r[2]), "text": r[3], "created": r[4]}
                 for r in rows]
 
+    def close(self) -> None:
+        """Release the SQLite handle. Required for clean shutdown — on Windows an open
+        WAL/connection keeps the db file locked and prevents temp-dir cleanup."""
+        with self._lock:
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
+
+    def __enter__(self) -> "MeshStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def mark_delivered(self, ids: list[str], to_did: str) -> None:
         """Mark results as delivered (don't delete; keep them for desktop console viewing), **bound to
         owner to_did**: a paired node cannot ack/mark someone else's results. After poll these are no
@@ -384,6 +399,10 @@ class MeshBroker:
 
     def stop(self):
         self._running = False
+        try:
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            pass
         if self._zc is not None:
             try:
                 self._zc.unregister_service(self._zc_info)
