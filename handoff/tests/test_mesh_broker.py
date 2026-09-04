@@ -214,13 +214,13 @@ def test_ack_bound_to_owner():
 def test_requeue_running_on_restart():
     """Startup requeue: tasks stuck in running are restored to pending."""
     with tempfile.TemporaryDirectory() as tmp:
-        store = mb.MeshStore(os.path.join(tmp, "q.db"))
-        store.add_task("t1", "didX", "p")
-        store.claim_next_task()  # → running
-        n = store.requeue_running()
-        assert n == 1, n
-        again = store.claim_next_task()  # should be claimable again
-        assert again and again["id"] == "t1", again
+        with mb.MeshStore(os.path.join(tmp, "q.db")) as store:
+            store.add_task("t1", "didX", "p")
+            store.claim_next_task()  # → running
+            n = store.requeue_running()
+            assert n == 1, n
+            again = store.claim_next_task()  # should be claimable again
+            assert again and again["id"] == "t1", again
         print("✓ test_requeue_running_on_restart")
 
 

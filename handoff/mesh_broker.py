@@ -137,6 +137,21 @@ class MeshStore:
         return [{"id": r[0], "ref": r[1], "ok": bool(r[2]), "text": r[3], "created": r[4]}
                 for r in rows]
 
+    def close(self) -> None:
+        """Release the SQLite handle. Required for clean shutdown — on Windows an open
+        WAL/connection keeps the db file locked and prevents temp-dir cleanup."""
+        with self._lock:
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
+
+    def __enter__(self) -> "MeshStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def mark_delivered(self, ids: list[str], to_did: str) -> None:
         """Mark results as delivered (don't delete; keep them for desktop console viewing), **bound to
         owner to_did**: a paired node cannot ack/mark someone else's results. After poll these are no
@@ -163,6 +178,7 @@ class MeshBroker:
 
     _sock: Optional[socket.socket] = None
     _running: bool = False
+    _worker: Optional[threading.Thread] = None   # kept so stop() can wait for the in-flight task
     _zc = None
     _zc_info = None
     _pairing_until: float = 0.0   # pairing-window expiry timestamp (time.time()); before this, not open
@@ -364,7 +380,8 @@ class MeshBroker:
                 threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
         threading.Thread(target=accept_loop, name="mesh-accept", daemon=True).start()
-        threading.Thread(target=self._worker_loop, name="mesh-worker", daemon=True).start()
+        self._worker = threading.Thread(target=self._worker_loop, name="mesh-worker", daemon=True)
+        self._worker.start()
         if advertise:
             self._advertise()
         return self.port
@@ -382,7 +399,22 @@ class MeshBroker:
             properties={"did": self.identity.device_id, "ver": str(PROTO)})
         self._zc.register_service(self._zc_info)
 
-    def stop(self):
+    def stop(self, close_store: bool = True, worker_grace_sec: float = 5.0):
+        """Shut down: stop accepting work, let the in-flight task finish, then release the SQLite handle.
+
+        🚨 **順序是有意義的，不要把 store.close() 移到前面。**
+
+        `_worker_loop` 的迴圈**主體會完整跑完**（含 `add_result` / `finish_task`）才回頭檢查
+        `_running`。所以只要等 worker 真的退出，在途任務的結果就已經落地。
+
+        反過來（先關 DB）會這樣壞：worker 正在跑 `_run_hermes`（上限 900 秒），使用者退出 →
+        DB 關掉 → worker 回來寫結果 → `sqlite3.ProgrammingError: Cannot operate on a closed
+        database`。而 `_worker_loop` **沒有 try/except** ⇒ 未捕捉例外 + **結果永久遺失**，
+        手機永遠等不到那則回覆，重開 companion 也救不回來。
+
+        等不到就**不關**：Windows 的檔案鎖只是清不掉暫存目錄，比弄丟使用者的答案輕得多。
+        （行程結束時 OS 自然會釋放 handle。）
+        """
         self._running = False
         if self._zc is not None:
             try:
@@ -395,6 +427,21 @@ class MeshBroker:
                 self._sock.close()
             except OSError:
                 pass
+        if not close_store:
+            return
+        w = self._worker
+        if w is not None and w.is_alive():
+            # 閒置時 worker 頂多卡在 time.sleep(1.0)，這個等待瞬間就過；
+            # 真的在跑任務時等不到 —— 那就別關，讓結果寫得進去。
+            w.join(timeout=worker_grace_sec)
+            if w.is_alive():
+                print("[mesh] worker still finishing a task — leaving the store open "
+                      "so its result is not lost", flush=True)
+                return
+        try:
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def pair_qr(self) -> str:
         """Pure pairing QR (for the phone to scan to establish trust). Reuses the handoff v1 schema."""
