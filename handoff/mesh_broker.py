@@ -38,6 +38,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+import nacl.exceptions
+
 import pairing as pr
 import handoff_server as hs
 import desktop_export as de   # handoff: export a session into an encryptable transport bundle
@@ -197,6 +199,7 @@ class MeshBroker:
             _peer = conn.getpeername()[0] if conn.fileno() != -1 else "?"
         except OSError:
             _peer = "?"
+        cdid = None   # 先給值：例外若發生在賦值之前，except 內引用它會變成 NameError 蓋掉真錯
         try:
             hello = json.loads(hs._recv_frame(conn).decode("utf-8"))
             cdid, cpk = hello["did"], pr._b64d(hello["pk"])
@@ -206,7 +209,18 @@ class MeshBroker:
                 print(f"[mesh] ✗ rejected {_peer} did={cdid[:8]}: not paired and pairing window closed", flush=True)
                 hs._send_frame(conn, json.dumps({"ok": False, "err": "not paired"}).encode())
                 return
-            hs._send_frame(conn, json.dumps({"ok": True, "proto": PROTO, "paired": paired}).encode())
+            # 🚨 ack 帶上 broker 自己的 did。手機拿它與存下來的 peer.deviceId 比對，
+            # 不符就當場給一句人話（「這台電腦的身分變了，請重新掃描配對碼」），
+            # 而不是讓它在下一步變成一個無解的 CryptoError。
+            #
+            # 為什麼安全：`_op_pair` 早就在回應裡帶 did，這只是把同一件事提前到握手。
+            # 手機端的 `handshake()` 只讀 `ok`/`err`，多出來的欄位會被忽略 ⇒
+            # **舊版 App 不受影響，不需要 bump PROTO**。
+            #
+            # ⚠️ 這是**防誤配不是防攻擊**：ack 在加密建立之前、是明文，控制網路的人可以偽造它。
+            # 真正的保證仍然在 Box 那一層。這個欄位的作用是把「金鑰對不上」講清楚，不是認證。
+            hs._send_frame(conn, json.dumps(
+                {"ok": True, "proto": PROTO, "paired": paired, "did": self.identity.device_id}).encode())
 
             # Encrypted request: a successful box_decrypt(broker_sk, cpk) means the peer holds the private
             # key for cpk (authenticating that public key) and encrypted to broker_pk (proving it scanned
@@ -235,6 +249,27 @@ class MeshBroker:
                 self._op_push_session(conn, req)  # reverse sync: phone uploads bundle, idempotently merge into PC
             else:
                 hs._send_frame(conn, json.dumps({"ok": False, "err": f"bad op: {op}"}).encode())
+        except nacl.exceptions.CryptoError:
+            # 🚨 解不開 = 對方是用**別把公鑰**加密的，幾乎一定是「手機存著這台電腦的舊身分」。
+            #
+            # 這是 issue #3 的實際症狀：`op=pair` / `op=pull` 全部正常（那兩個用剛掃的 QR 公鑰），
+            # 只有 `op=push_session` 掛掉（手機的 syncBack() 用 peers 的**第一筆**——最舊的）。
+            # 使用者看到的是裸的 CryptoError，完全無從下手，最後把整個 App 重灌才好。
+            #
+            # log 也要帶上兩邊的 did —— 原本連是誰、在做哪個 op 都看不出來
+            #（op 是在解密**之後**才印的）。
+            print(f"[mesh] ✗ {_peer} did={cdid[:8] if cdid else '?'}: cannot decrypt — "
+                  f"the phone encrypted to a different desktop key (mine={self.identity.device_id[:8]}). "
+                  f"The phone is holding a stale pairing; re-scan the pairing QR.", flush=True)
+            try:
+                hs._send_frame(conn, json.dumps({
+                    "ok": False,
+                    "err": "desktop identity changed (the phone is paired to an older key) "
+                           "— re-scan the pairing QR on the phone",
+                    "did": self.identity.device_id,
+                }).encode())
+            except OSError:
+                pass
         except Exception as e:  # noqa: BLE001 — a single-connection error must not take down the broker
             print(f"[mesh] ✗ connection {_peer} handling error: {type(e).__name__}: {e}", flush=True)
             try:
