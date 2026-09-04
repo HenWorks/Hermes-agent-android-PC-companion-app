@@ -14,13 +14,16 @@ sys.path.insert(0, os.path.join(HERE, "handoff"))
 
 
 def main() -> int:
+    # 🚨 argv 一定要往下傳。原本兩條路都是無參數呼叫，於是打包版在任何有 GUI 的桌面上
+    # 都會靜默吃掉 --session / --host / --port / --home（公開 repo issue #1）。
+    argv = sys.argv[1:]
     try:
         import companion_app
-        return companion_app.main()
+        return companion_app.main(argv)
     except Exception as e:  # noqa: BLE001 — no display / no tray backend → console mode
         print(f"(tray unavailable: {e}; running in console mode)")
         import mesh_broker
-        return mesh_broker.main()
+        return mesh_broker.main(argv)
 
 
 if __name__ == "__main__":

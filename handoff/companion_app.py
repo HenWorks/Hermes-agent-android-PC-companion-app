@@ -37,16 +37,28 @@ def _url_file() -> str:
     return os.path.join(home, "mesh", "console.url")
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """托盤模式。
+
+    🚨 `argv` 這個參數是修復 issue #1 加上的：這支原本**完全不看命令列參數**
+    （直接 `mb.serve()` 無參數），而 `companion.py` 只有在托盤起不來時才退到
+    `mesh_broker.main()`——也就是說在**所有桌面 GUI 環境**下，`--session` /
+    `--host` / `--port` / `--home` 全部被靜默吞掉。使用者回報
+    「`hermes-companion.exe --session <id>` 只顯示配對 QR」正是這個。
+
+    參數定義共用 [mesh_broker.build_arg_parser]，不在這裡另寫一份。
+    """
     # pystray import first so a missing module surfaces before we start the broker.
     import pystray
+
+    a = mb.parse_args(argv)
 
     # Single instance: the broker owns a fixed port, so a second launch can't bind it.
     # Rather than crash, detect the already-running instance and just reopen its console.
     # Narrow to EADDRINUSE only — any other startup OSError (e.g. EADDRNOTAVAIL, a real
     # bind/network failure) must propagate, not be masked as "already running".
     try:
-        broker = mb.serve()
+        broker = mb.serve(a.home, host=a.host, port=a.port)
     except OSError as e:
         if e.errno != errno.EADDRINUSE:
             raise
@@ -63,7 +75,7 @@ def main() -> int:
     try:
         broker.open_pairing(300)
         try:
-            web_host, web_port = cw.serve_web(broker)
+            web_host, web_port = cw.serve_web(broker, session=a.session)
             url = f"http://{web_host}:{web_port}/"
             # Save so a second launch can reopen this console instead of failing.
             try:

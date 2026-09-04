@@ -67,6 +67,7 @@ def _read_history(db_path: str, limit: int = 20):
 
 class _Handler(BaseHTTPRequestHandler):
     broker = None  # injected via partial
+    session = None  # --session：有值時主控台顯示 handoff QR 而非純配對 QR
 
     def log_message(self, *a):  # noqa: A002 — silence the access log
         pass
@@ -92,6 +93,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _status(self) -> dict:
         b = self.broker
+        _session = self.session
         pairing_left = max(0, int(b._pairing_until - time.time()))
         paired = list(b.peers._peers.keys())
         tasks, results = _read_history(b.store.path)
@@ -108,17 +110,22 @@ class _Handler(BaseHTTPRequestHandler):
             "paired": [d[:8] for d in paired],
             "paired_count": len(paired),
             "pairing_left": pairing_left,
-            "pair_code": b.pair_qr(),   # QR 由前端從這個字串產生，不再回傳 PNG
+            # QR 由前端從這個字串產生，不再回傳 PNG。
+            # 指定了 --session 就給 handoff QR（手機掃了之後配對**並**收下那段對話），
+            # 否則給純配對 QR —— 與 mesh_broker.main() 的終端輸出同一套規則。
+            "pair_code": (b.handoff_qr(_session) if _session else b.pair_qr()),
             "tasks": tasks,
         }
 
 
-def serve_web(broker, host: str = "127.0.0.1", port: int = 0):
+def serve_web(broker, host: str = "127.0.0.1", port: int = 0, session: str | None = None):
     """Start the local console web server (daemon thread). Returns (host, port). Binds to 127.0.0.1 for the local browser only."""
-    handler = partial(_Handler)
-    handler.broker = broker  # type: ignore[attr-defined]
-    # partial can't set class attributes → set it directly on _Handler (a single broker process, which is enough)
+    # 🚨 這裡原本還有 `handler = partial(_Handler)` + `handler.broker = ...` 三行**死碼**：
+    # `httpd` 是直接用 `_Handler` 建的，那個 partial 從來沒被用過，設在它上面的屬性
+    # 也就從來沒生效。我加 session 時第一版正好寫到那個死掉的地方，測試才抓出來。
+    # 單一 broker 行程，設在類別上就夠。
     _Handler.broker = broker
+    _Handler.session = session
     httpd = ThreadingHTTPServer((host, port), _Handler)
     actual_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, name="companion-web", daemon=True).start()

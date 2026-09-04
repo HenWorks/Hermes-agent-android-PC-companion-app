@@ -492,13 +492,18 @@ def add_peer_from_phone(broker: MeshBroker, phone_did: str, phone_pk_b64: str) -
     broker.peers.add(phone_did, pr._b64d(phone_pk_b64))
 
 
-def main(argv=None) -> int:
-    import argparse
-    try:
-        import qrcode  # optional: print a QR image in the terminal; if absent, print text only
-    except ImportError:
-        qrcode = None
+def build_arg_parser():
+    """CLI 參數的**唯一**定義。
 
+    🚨 抽出來給 [companion_app] 共用。它原本完全不看 argv（直接 `mb.serve()` 無參數），
+    於是打包版只要托盤起得來——也就是**所有桌面 GUI 環境**——`--session` / `--host` /
+    `--port` / `--home` 全部被**靜默忽略**。使用者回報
+    「`hermes-companion.exe --session <id>` 只顯示配對 QR」就是這個
+    （公開 repo issue #1）。他沒用錯，是打包版根本不吃參數。
+
+    定義只留一份：兩邊各寫一份 argparse 的話，加旗標時必然只改到一邊。
+    """
+    import argparse
     ap = argparse.ArgumentParser(
         prog="hermes-companion",
         description="hermes desktop companion service: collaborative dispatch (mesh) + conversation handoff, one process, one pairing")
@@ -507,8 +512,23 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"broker bind port (default fixed {DEFAULT_PORT}; fixed so the phone keeps reaching it after pairing)")
     ap.add_argument("--session", default=None,
-                    help="handoff a specific session: print a handoff QR (the phone pairs + receives this conversation after scanning). Omit to print a pure pairing QR.")
-    a = ap.parse_args(argv)
+                    help="handoff a specific session: show a handoff QR (the phone pairs + receives this conversation after scanning). Omit for a pure pairing QR.")
+    return ap
+
+
+def parse_args(argv=None):
+    """`argv=None` → 讀 `sys.argv[1:]`（argparse 的預設行為）。"""
+    return build_arg_parser().parse_args(argv)
+
+
+def main(argv=None) -> int:
+    import argparse
+    try:
+        import qrcode  # optional: print a QR image in the terminal; if absent, print text only
+    except ImportError:
+        qrcode = None
+
+    a = parse_args(argv)
 
     broker = serve(a.home, host=a.host, port=a.port)
     broker.open_pairing(300)  # open a 5-minute pairing window at startup, so the phone can complete reverse pairing after scanning the QR
