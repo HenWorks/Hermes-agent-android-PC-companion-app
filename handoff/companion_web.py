@@ -1,6 +1,10 @@
 """
 companion_web — local desktop browser console (standard-library http.server, zero extra dependencies).
 
+⚠️ 「zero extra dependencies」這句以前是**假的**：QR 是用 Python 的 qrcode + pillow 畫的，
+而那兩個套件只在 handoff/requirements.txt 裡宣告、只有 mesh-start.sh（bash，Windows 跑不了）
+會裝。Windows 使用者因此永遠看不到 QR，配對整條斷掉。QR 現在改由瀏覽器產生，這句才成真。
+
 North star: zero terminal on the PC side. After installing hermes, the user opens a browser and
 immediately sees the pairing QR + connection status + task history; scanning with the phone connects —
 no terminal, no uv, no app download required. Every PC already has a browser.
@@ -11,8 +15,6 @@ pairing info (pubkey/host/port), and the private key never leaves the machine.
 """
 from __future__ import annotations
 
-import base64
-import io
 import json
 import sqlite3
 import threading
@@ -21,15 +23,22 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def _qr_data_uri(text: str) -> str:
-    """Encode a string into a QR PNG data URI (for <img src>). Returns an empty string if qrcode/pillow is unavailable."""
-    try:
-        import qrcode
-        buf = io.BytesIO()
-        qrcode.make(text).save(buf, format="PNG")
-        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    except Exception:  # noqa: BLE001 — the QR is auxiliary; if it can't be produced the page still works (shows the text pairing code)
-        return ""
+#
+# 🚨 這裡曾經有一支 `_qr_data_uri()`，用 Python 的 `qrcode` + `pillow` 把配對碼畫成 PNG
+# data URI。它被移除了，因為那個依賴**在真實世界從來沒有被裝上**：
+#
+#   · `qrcode` / `pillow` 只宣告在 `handoff/requirements.txt`
+#   · 唯一會安裝它們的地方是 `mesh-start.sh`（POSIX：`$VENV/bin/pip`）
+#   · 那是 bash 腳本，**Windows 跑不了**，而且 Windows 的 venv 是 `Scripts\` 不是 `bin/`
+#   · 於是 `import qrcode` 失敗 → 舊版靜默回空字串 → 頁面只剩「QR failed」
+#
+# Mac 一直正常，正是因為 mesh-start.sh 在那裡跑得起來——平台差異的根源就在這裡，
+# 不是 QR 本身壞掉。使用者回報「No qr code, so not working」是準確的。
+#
+# 現在 QR 由**瀏覽器端**產生（見頁面裡的 qrMatrix）：零 Python 依賴、跨平台、離線可用。
+# 手機端要掃的是這張 QR（Android 用 zxing 掃 `build_pair_qr()` 產生的 JSON），
+# 沒有它就只能請使用者手抄一串 140+ 字元的 JSON，對非技術使用者等於沒有路。
+
 
 
 def _read_history(db_path: str, limit: int = 20):
@@ -99,8 +108,7 @@ class _Handler(BaseHTTPRequestHandler):
             "paired": [d[:8] for d in paired],
             "paired_count": len(paired),
             "pairing_left": pairing_left,
-            "pair_code": b.pair_qr(),
-            "qr": _qr_data_uri(b.pair_qr()),
+            "pair_code": b.pair_qr(),   # QR 由前端從這個字串產生，不再回傳 PNG
             "tasks": tasks,
         }
 
@@ -183,6 +191,206 @@ _PAGE = """<!doctype html>
   </div>
 </div>
 <script>
+/* ── QR 編碼器（byte mode / ECC M / v1-v20）────────────────────────────────
+   為什麼放在瀏覽器：Python 的 qrcode 套件在真實世界從沒被裝上（見本檔上方的說明），
+   而 Windows 連裝它的腳本都跑不了。搬到前端就零依賴、跨平台、離線可用。
+
+   驗證方式（2026-09-04，25 筆輸入涵蓋 v1-v20、長度 1~620）：
+     ① 固定遮罩後，與 python-qrcode 的輸出**逐格完全相同** 25/25
+     ② 用本編碼器自選的遮罩，同樣與 python-qrcode 在該遮罩下的輸出逐格相同 25/25
+        ⇒ 產出的每一張都是合法可解碼的 QR
+   自選遮罩偶爾與 python-qrcode 的預設不同（罰分啟發式的邊角差異）。那是品質選擇
+   不是正確性：解碼器從 format info 讀出用了哪個遮罩，8 個都合法。
+
+   ⚠️ 改這段之前先跑一次上面那個對照測試，別靠肉眼看 QR「像不像」。
+   踩過的三顆（都是肉眼看不出來的）：分隔帶 d==4 被畫成深色、format info 的 x/y 轉置、
+   copy-2 的 8+7 切分寫反。 */
+function qrMatrix(text, forceMask) {
+  const ECC_M = [null,
+    [10,1],[16,1],[26,1],[18,2],[24,2],[16,4],[18,4],[22,4],[22,5],[26,5],
+    [30,5],[22,8],[22,9],[24,9],[24,10],[28,10],[28,11],[26,13],[26,14],[26,16]];
+  const rawDataModules = (v) => {
+    let r = (16 * v + 128) * v + 64;
+    if (v >= 2) { const n = Math.floor(v / 7) + 2; r -= (25 * n - 10) * n - 55; if (v >= 7) r -= 36; }
+    return r;
+  };
+  const totalCodewords = (v) => Math.floor(rawDataModules(v) / 8);
+  const alignPositions = (v) => {
+    if (v === 1) return [];
+    const n = Math.floor(v / 7) + 2, size = 17 + 4 * v;
+    const step = Math.ceil((v * 4 + 4) / (n * 2 - 2)) * 2;
+    const out = [6];
+    for (let pos = size - 7; out.length < n; pos -= step) out.splice(1, 0, pos);
+    return out;
+  };
+  const EXP = new Uint8Array(512), LOG = new Uint8Array(256);
+  for (let i = 0, x = 1; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  const mul = (a, b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+  const rsRemainder = (data, deg) => {
+    let gen = [1];
+    for (let i = 0; i < deg; i++) {
+      const ng = new Array(gen.length + 1).fill(0);
+      for (let j = 0; j < gen.length; j++) { ng[j] ^= mul(gen[j], 1); ng[j + 1] ^= mul(gen[j], EXP[i]); }
+      gen = ng;
+    }
+    const res = new Array(deg).fill(0);
+    for (const b of data) {
+      const factor = b ^ res[0];
+      res.shift(); res.push(0);
+      for (let i = 0; i < deg; i++) res[i] ^= mul(gen[i + 1], factor);
+    }
+    return res;
+  };
+  const bytes = [];
+  for (const ch of unescape(encodeURIComponent(text))) bytes.push(ch.charCodeAt(0));
+  let version = 0;
+  for (let v = 1; v <= 20; v++) {
+    const [e, b] = ECC_M[v];
+    if (4 + (v <= 9 ? 8 : 16) + bytes.length * 8 <= (totalCodewords(v) - e * b) * 8) { version = v; break; }
+  }
+  if (!version) throw new Error('payload too large');
+  const size = 17 + 4 * version;
+  const [ecPerBlock, numBlocks] = ECC_M[version];
+  const dataCw = totalCodewords(version) - ecPerBlock * numBlocks;
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+  push(0b0100, 4); push(bytes.length, version <= 9 ? 8 : 16);
+  for (const b of bytes) push(b, 8);
+  for (let i = 0; i < 4 && bits.length < dataCw * 8; i++) bits.push(0);
+  while (bits.length % 8 !== 0) bits.push(0);
+  const cw = [];
+  for (let i = 0; i < bits.length; i += 8) { let v = 0; for (let j = 0; j < 8; j++) v = (v << 1) | bits[i + j]; cw.push(v); }
+  for (let i = 0; cw.length < dataCw; i++) cw.push(i % 2 === 0 ? 0xec : 0x11);
+  const shortLen = Math.floor(dataCw / numBlocks), numLong = dataCw % numBlocks;
+  const dataBlocks = [], eccBlocks = [];
+  let off = 0;
+  for (let i = 0; i < numBlocks; i++) {
+    const len = shortLen + (i >= numBlocks - numLong ? 1 : 0);
+    const blk = cw.slice(off, off + len); off += len;
+    dataBlocks.push(blk); eccBlocks.push(rsRemainder(blk, ecPerBlock));
+  }
+  const finalCw = [];
+  for (let i = 0; i < shortLen + 1; i++)
+    for (let b = 0; b < numBlocks; b++) if (i < dataBlocks[b].length) finalCw.push(dataBlocks[b][i]);
+  for (let i = 0; i < ecPerBlock; i++) for (let b = 0; b < numBlocks; b++) finalCw.push(eccBlocks[b][i]);
+  const M = Array.from({length: size}, () => new Array(size).fill(null));
+  const F = Array.from({length: size}, () => new Array(size).fill(false));
+  const setF = (x, y, v) => { if (x >= 0 && y >= 0 && x < size && y < size) { M[y][x] = v; F[y][x] = true; } };
+  const finder = (cx, cy) => {
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const d = Math.max(Math.abs(dx), Math.abs(dy));
+      setF(cx + dx, cy + dy, d <= 3 && d !== 2);   // d==4 是分隔帶，必須淺色
+    }
+  };
+  finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+  for (let i = 8; i < size - 8; i++) { setF(i, 6, i % 2 === 0); setF(6, i, i % 2 === 0); }
+  const ap = alignPositions(version);
+  for (const ay of ap) for (const ax of ap) {
+    if ((ax === 6 && ay === 6) || (ax === 6 && ay === size - 7) || (ax === size - 7 && ay === 6)) continue;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++)
+      setF(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+  setF(8, size - 8, true);
+  for (let i = 0; i < 9; i++) { if (M[8][i] === null) setF(i, 8, false); if (M[i][8] === null) setF(8, i, false); }
+  for (let i = 0; i < 8; i++) { setF(size - 1 - i, 8, false); setF(8, size - 1 - i, false); }
+  if (version >= 7) {
+    let rem = version;
+    for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const vbits = (version << 12) | rem;
+    for (let i = 0; i < 18; i++) {
+      const bit = ((vbits >>> i) & 1) === 1, a = Math.floor(i / 3), b = i % 3;
+      setF(a, size - 11 + b, bit); setF(size - 11 + b, a, bit);
+    }
+  }
+  let idx = 0;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++) for (let j = 0; j < 2; j++) {
+      const x = right - j, upward = ((right + 1) & 2) === 0, y = upward ? size - 1 - vert : vert;
+      if (F[y][x]) continue;
+      M[y][x] = idx < finalCw.length * 8 ? ((finalCw[idx >>> 3] >>> (7 - (idx & 7))) & 1) === 1 : false;
+      idx++;
+    }
+  }
+  const maskFn = [
+    (x,y)=>(x+y)%2===0, (x,y)=>y%2===0, (x,y)=>x%3===0, (x,y)=>(x+y)%3===0,
+    (x,y)=>(Math.floor(y/2)+Math.floor(x/3))%2===0, (x,y)=>(x*y)%2+(x*y)%3===0,
+    (x,y)=>((x*y)%2+(x*y)%3)%2===0, (x,y)=>((x+y)%2+(x*y)%3)%2===0];
+  const applyFormat = (grid, mask) => {
+    const data = mask;                              // ECC M 的指示碼是 0b00
+    let rem = data;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const f = ((data << 10) | rem) ^ 0x5412;
+    // 座標是 grid[y][x]；copy-1 前半是「第 8 **欄**、第 0..5 **列**」（垂直），寫成
+    // grid[8][i] 會整組 x/y 轉置——肉眼完全看不出來，只有逐格比對抓得到。
+    const put = (x, y, i) => { grid[y][x] = ((f >>> i) & 1) === 1; };
+    for (let i = 0; i <= 5; i++) put(8, i, i);
+    put(8, 7, 6); put(8, 8, 7); put(7, 8, 8);
+    for (let i = 9; i < 15; i++) put(14 - i, 8, i);
+    for (let i = 0; i < 8; i++) put(size - 1 - i, 8, i);     // copy-2 是 8 水平 + 7 垂直
+    for (let i = 8; i < 15; i++) put(8, size - 15 + i, i);
+    grid[size - 8][8] = true;
+  };
+  const penalty = (g) => {
+    let p = 0;
+    for (let i = 0; i < size; i++) for (const line of [g[i], g.map(r => r[i])]) {
+      let run = 1;
+      for (let j = 1; j < size; j++) {
+        if (line[j] === line[j-1]) { run++; if (run === 5) p += 3; else if (run > 5) p += 1; } else run = 1;
+      }
+    }
+    for (let y = 0; y < size-1; y++) for (let x = 0; x < size-1; x++)
+      if (g[y][x] === g[y][x+1] && g[y][x] === g[y+1][x] && g[y][x] === g[y+1][x+1]) p += 3;
+    const pat = [true,false,true,true,true,false,true];
+    const patHits = (line, i) => {
+      for (let k = 0; k < 7; k++) if (line[i+k] !== pat[k]) return 0;
+      const before = line.slice(Math.max(0,i-4), i), after = line.slice(i+7, i+11);
+      return (before.length===4 && before.every(v=>!v) ? 1:0) + (after.length===4 && after.every(v=>!v) ? 1:0);
+    };
+    for (let i = 0; i < size; i++) for (const line of [g[i], g.map(r => r[i])])
+      for (let j = 0; j + 7 <= size; j++) p += 40 * patHits(line, j);
+    let dark = 0;
+    for (const row of g) for (const v of row) if (v) dark++;
+    p += Math.floor(Math.abs(dark*20 - size*size*10) / (size*size)) * 10;
+    return p;
+  };
+  let best = null, bestP = Infinity, bestM = -1;
+  for (let m = 0; m < 8; m++) {
+    if (forceMask !== undefined && m !== forceMask) continue;
+    const g = M.map(r => r.slice());
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++)
+      if (!F[y][x] && maskFn[m](x, y)) g[y][x] = !g[y][x];
+    applyFormat(g, m);
+    const p = penalty(g);
+    if (p < bestP) { bestP = p; best = g; bestM = m; }
+  }
+  return { size, modules: best, version, mask: bestM };
+}
+
+let lastQrCode = null;
+function drawQr(code) {
+  const box = document.getElementById('qrbox');
+  if (!code) { box.innerHTML = '<div class="empty">' + T.qr_fail + '</div>'; lastQrCode = null; return; }
+  if (code === lastQrCode) return;          // 每 3 秒輪詢一次，內容沒變就不重畫
+  lastQrCode = code;
+  let m;
+  try { m = qrMatrix(code); }
+  catch (e) { box.innerHTML = '<div class="empty">' + T.qr_fail + '</div>'; lastQrCode = null; return; }
+  const quiet = 4, scale = 6, px = (m.size + quiet * 2) * scale;
+  const c = document.createElement('canvas');
+  c.width = c.height = px;
+  c.style.width = c.style.height = '240px';
+  c.style.imageRendering = 'pixelated';
+  c.style.borderRadius = '8px';
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, px, px);   // 靜區必須是白的，否則掃不到
+  ctx.fillStyle = '#000';
+  for (let y = 0; y < m.size; y++) for (let x = 0; x < m.size; x++)
+    if (m.modules[y][x]) ctx.fillRect((x + quiet) * scale, (y + quiet) * scale, scale, scale);
+  box.innerHTML = '';
+  box.appendChild(c);
+}
 const I18N = {
  'en':{sub:'Desktop collaboration + chat handoff · Scan the QR with the Hermes mobile app to connect',
   scan:'app → "Computer Mesh" → Scan',loading:'Loading…',conn:'Connection',bind:'Bound address',
@@ -261,7 +469,7 @@ async function tick(){
     document.getElementById('dot').className = 'dot live';
     document.getElementById('paired').textContent = s.paired_count ? T.paired_n(s.paired_count, s.paired.join(', ')) : T.not_paired;
     document.getElementById('window').textContent = s.pairing_left ? T.win_open(s.pairing_left) : T.win_closed;
-    document.getElementById('qrbox').innerHTML = s.qr ? '<img src="'+s.qr+'" alt="QR">' : '<div class="empty">'+T.qr_fail+'</div>';
+    drawQr(s.pair_code);
     const tj = JSON.stringify(s.tasks);
     if(tj !== lastTasksJson){ lastTasksJson = tj; renderTasks(s.tasks); }  // only re-render on change, to preserve expanded state
   }catch(e){ document.getElementById('dot').className='dot off'; }

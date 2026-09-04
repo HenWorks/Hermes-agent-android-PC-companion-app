@@ -2,6 +2,10 @@
 # (The phone side uses lazysodium-android + Android NSD, not these.)
 PyNaCl>=1.5        # NaCl box e2e encryption (same libsodium underneath as Android lazysodium — interoperable)
 zeroconf>=0.130    # mDNS service advertisement (the phone discovers via Android NSD)
-qrcode>=7          # render the pairing/handoff QR (browser console + terminal)
-pillow>=9          # image backend for qrcode + the tray icon
+# ⚠️ 下面兩個是**選用**的，缺了不影響配對。
+# 瀏覽器主控台的 QR 從 2026-09-04 起由前端自己產生（companion_web.py 的 qrMatrix），
+# 零 Python 依賴——因為這兩個套件在 Windows 上從來沒被裝上過（唯一會裝它們的
+# mesh-start.sh 是 bash + POSIX venv 路徑），使用者因此看不到 QR、配對整條斷掉。
+qrcode>=7          # 選用：終端的 ASCII QR（SSH / 無 GUI 時用）；缺了就只印文字配對碼
+pillow>=9          # 選用：托盤圖示（companion_app.py）；**不再**是 QR 的後端
 pystray>=0.19      # cross-platform system-tray / menu-bar app (companion_app.py)
