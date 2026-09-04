@@ -76,8 +76,19 @@ def test_tray_path_accepts_argv():
 
 
 def test_entry_point_forwards_argv():
-    """companion.py 的**兩條**路都要傳 argv —— 只修一條等於只修一半的使用者。"""
-    with open(os.path.join(_REPO, "companion.py"), encoding="utf-8") as f:
+    """
+    companion.py 的**兩條**路都要傳 argv —— 只修一條等於只修一半的使用者。
+
+    ⚠️ `companion.py` 是 PyInstaller 的打包進入點，**只存在公開 companion repo**，
+    monorepo 的 `handoff/` 沒有它（那裡是這個模組的上游來源，不負責打包）。
+    所以檔案不在時 skip 而不是紅——但**檔案在的話一律嚴格檢查**，不能因為
+    「可能不存在」就整條放行。
+    """
+    entry = os.path.join(_REPO, "companion.py")
+    if not os.path.exists(entry):
+        import pytest
+        pytest.skip("companion.py 只存在打包用的公開 repo；此處為上游來源樹")
+    with open(entry, encoding="utf-8") as f:
         src = f.read()
     assert "sys.argv[1:]" in src, "進入點沒有取 argv"
     assert "companion_app.main(argv)" in src, "托盤路徑沒收到 argv（GUI 桌面走這條）"
