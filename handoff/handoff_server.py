@@ -73,6 +73,25 @@ class PeerStore:
         known = self.pubkey(device_id)
         return known is not None and known == pubkey
 
+    def remove(self, device_id: str) -> bool:
+        """撤銷一台已配對裝置的信任。回傳它本來在不在。
+
+        🚨 這支存在的理由：**信任只能增不能減**是這個系統反覆出事的形狀。
+        原本 PeerStore 只有 add/pubkey/is_paired —— 一旦某支手機的公鑰進了這個檔，
+        就永遠被接受，沒有任何 GUI 或 CLI 撤銷得了它，使用者只能自己手改 JSON。
+
+        實際的觸發點：手機的備份匯出檔在 2026-09-04 之前**含有手機的 NaCl 私鑰**
+        （`~/.hermes/mesh/id.key`）。那個 zip 被設計成「丟雲端硬碟、用 IM 傳給自己」，
+        拿到它的人在同一個區網／tailnet 內就能冒充那支手機對這台電腦派工，
+        而派工內容會以 `hermes -z <prompt>` 在這裡執行。
+        手機端換新身分**救不了**——撤銷必須發生在這一端，因為信任清單在這裡。
+        """
+        if device_id not in self._peers:
+            return False
+        del self._peers[device_id]
+        self._save()
+        return True
+
 
 # ── wire framing ──────────────────────────────────────────────────────────────
 
