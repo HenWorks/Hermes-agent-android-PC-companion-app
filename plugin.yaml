@@ -1,0 +1,12 @@
+name: hermes-companion
+version: 1.0.0
+manifest_version: 1
+kind: standalone
+description: "PC-side companion for the Hermes-agent Android app — mesh (run tasks on your computer) + handoff (move conversations between PC and phone). NaCl-encrypted, pair-once, no cloud."
+author: HenWorks
+license: AGPL-3.0
+provides_tools: []
+provides_hooks: []
+python_dependencies:
+  - "PyNaCl>=1.5"
+  - "zeroconf>=0.130"
