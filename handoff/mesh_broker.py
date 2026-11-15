@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sys
 import sqlite3
@@ -54,6 +55,14 @@ MAX_RESULT_CHARS = 64 * 1024  # per-result cap, to avoid an abnormally long outp
 # It's a plain prompt string, called via `hermes -z` as usual — it doesn't touch upstream packages
 # or change the state.db schema, so upstream updates are unaffected.
 MESH_TASK_MARKER = "📱 [Phone dispatch] "
+
+# A follow-up conversation id sent by the phone (it generates them; short, URL-safe).
+_THREAD_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+
+
+def thread_title(from_did: str, thread: str) -> str:
+    """The hermes session title a phone conversation lives under — one per (phone, thread)."""
+    return f"mesh-{from_did[:8]}-{thread}"
 # Fixed default port (⚠️ must be fixed, not random): after pairing, the phone app stores host:port
 # in the peer and keeps connecting with it. If the broker picks a new port on every restart, the
 # phone can't reach it (shows offline, dispatch fails). 51379 is a high port that avoids common services.
@@ -95,23 +104,30 @@ class MeshStore:
                         "ALTER TABLE results ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
+        # migration: conversation thread for multi-turn follow-ups (NULL = a standalone one-shot task)
+        with self._lock:
+            try:
+                with self._db:
+                    self._db.execute("ALTER TABLE tasks ADD COLUMN thread TEXT")
+            except sqlite3.OperationalError:
+                pass
 
-    def add_task(self, task_id: str, from_did: str, prompt: str) -> None:
+    def add_task(self, task_id: str, from_did: str, prompt: str, thread: Optional[str] = None) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT OR IGNORE INTO tasks(id, from_did, prompt, status, created) "
-                "VALUES(?,?,?,'pending',?)", (task_id, from_did, prompt, time.time()))
+                "INSERT OR IGNORE INTO tasks(id, from_did, prompt, status, created, thread) "
+                "VALUES(?,?,?,'pending',?,?)", (task_id, from_did, prompt, time.time(), thread))
 
     def claim_next_task(self) -> Optional[dict]:
-        """Atomically take one pending task → mark running, return {id, from_did, prompt}. None if none."""
+        """Atomically take one pending task → mark running, return {id, from_did, prompt, thread}. None if none."""
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT id, from_did, prompt FROM tasks WHERE status='pending' "
+                "SELECT id, from_did, prompt, thread FROM tasks WHERE status='pending' "
                 "ORDER BY created LIMIT 1").fetchone()
             if not row:
                 return None
             self._db.execute("UPDATE tasks SET status='running' WHERE id=?", (row[0],))
-            return {"id": row[0], "from_did": row[1], "prompt": row[2]}
+            return {"id": row[0], "from_did": row[1], "prompt": row[2], "thread": row[3]}
 
     def finish_task(self, task_id: str) -> None:
         with self._lock, self._db:
@@ -174,6 +190,11 @@ class MeshBroker:
     store: MeshStore
     # command to run a task; {prompt} is passed by the worker as an argument (no shell string concatenation, injection-safe)
     hermes_cmd: list[str] = field(default_factory=lambda: ["hermes", "-z"])
+    # Multi-turn follow-ups: the command prefix that reads ONE prompt from stdin and continues the
+    # conversation titled by the `-c <title> --create-if-missing` the worker appends. None = derive it
+    # from hermes_cmd (`hermes -z` → `hermes chat -Q --query-file -`) when that hermes supports it
+    # (`--create-if-missing`, hermes ≥ 0.22.0); otherwise follow-ups fall back to standalone tasks.
+    thread_cmd: Optional[list[str]] = None
     home: Optional[str] = None
     host: str = ""          # binds to a LAN IP by default (see start); never 0.0.0.0
     port: int = 0           # 0 = auto-select
@@ -184,6 +205,7 @@ class MeshBroker:
     _zc = None
     _zc_info = None
     _pairing_until: float = 0.0   # pairing-window expiry timestamp (time.time()); before this, not open
+    _threads_ok: Optional[bool] = None   # cached answer of _threads_supported()
 
     # ---- pairing window ----
     def open_pairing(self, window_sec: int = 300) -> None:
@@ -299,8 +321,13 @@ class MeshBroker:
             hs._send_frame(conn, json.dumps({"ok": False, "err": "empty prompt"}).encode())
             return
         tid = task.get("id") or uuid.uuid4().hex
-        self.store.add_task(tid, cdid, prompt)
-        hs._send_frame(conn, json.dumps({"ok": True, "id": tid}).encode())
+        # A phone that wants follow-ups sends a thread id. It is only honoured when this computer's hermes
+        # can continue a named conversation; the reply tells the phone whether it was, so the phone shows
+        # "Follow up" only on tasks that really are part of a conversation (an older companion simply omits it).
+        thread = task.get("thread")
+        thread = thread if isinstance(thread, str) and _THREAD_ID.fullmatch(thread) and self._threads_supported() else None
+        self.store.add_task(tid, cdid, prompt, thread)
+        hs._send_frame(conn, json.dumps({"ok": True, "id": tid, "thread": thread is not None}).encode())
 
     def _op_poll(self, conn, cpk: bytes, cdid: str):
         results = self.store.pending_results(cdid)
@@ -365,20 +392,63 @@ class MeshBroker:
                   f"{task['prompt'][:80]}  → running {' '.join(self.hermes_cmd)} …", flush=True)
             t0 = time.time()
             # add an identifiable prefix → the desktop session history shows at a glance it's phone-dispatched; an independent session, no shared context.
-            ok, text = self._run_hermes(MESH_TASK_MARKER + task["prompt"])
+            if task.get("thread"):
+                ok, text = self._run_hermes_in_thread(MESH_TASK_MARKER + task["prompt"],
+                                                      thread_title(task["from_did"], task["thread"]))
+            else:
+                ok, text = self._run_hermes(MESH_TASK_MARKER + task["prompt"])
             print(f"[mesh] {'✓' if ok else '✗'} task {task['id'][:8]} done ({time.time()-t0:.1f}s)"
                   f": {text[:100].replace(chr(10), ' ')}", flush=True)
             self.store.add_result(task["id"], task["from_did"], ok, text)
             self.store.finish_task(task["id"])
             print(f"[mesh] ⇧ result placed in the phone inbox, waiting for the phone to poll it", flush=True)
 
-    def _run_hermes(self, prompt: str) -> tuple[bool, str]:
+    def _thread_cmd_base(self) -> Optional[list[str]]:
+        if self.thread_cmd is not None:
+            return self.thread_cmd
+        if self.hermes_cmd and self.hermes_cmd[-1] == "-z":
+            return self.hermes_cmd[:-1] + ["chat", "-Q", "--query-file", "-"]
+        return None   # a custom HERMES_MESH_CMD: no known way to continue a conversation
+
+    def _threads_supported(self) -> bool:
+        """Can this computer's hermes continue a named conversation? Asked once (hermes chat --help)."""
+        if self._threads_ok is None:
+            base = self._thread_cmd_base()
+            if base is None:
+                self._threads_ok = False
+            elif self.thread_cmd is not None:
+                self._threads_ok = True
+            else:
+                try:
+                    help_cmd = base[:base.index("chat") + 1] + ["--help"]
+                    out = subprocess.run(help_cmd, capture_output=True, text=True, timeout=60,
+                                         env=self._env()).stdout or ""
+                    self._threads_ok = "--create-if-missing" in out
+                except Exception:  # noqa: BLE001 — unknown ⇒ single-turn, never a failed task
+                    self._threads_ok = False
+        return self._threads_ok
+
+    def _env(self) -> dict:
         env = dict(os.environ)
         if self.home:
             env["HERMES_HOME"] = self.home
+        return env
+
+    def _run_hermes_in_thread(self, prompt: str, title: str) -> tuple[bool, str]:
+        """Continue (or start) the conversation named `title`; the prompt goes on stdin, never argv."""
+        base = self._thread_cmd_base()
+        if base is None:
+            return self._run_hermes(prompt)
+        return self._run(base + ["-c", title, "--create-if-missing"], stdin=prompt)
+
+    def _run_hermes(self, prompt: str) -> tuple[bool, str]:
+        return self._run(self.hermes_cmd + [prompt])
+
+    def _run(self, cmd: list[str], stdin: Optional[str] = None) -> tuple[bool, str]:
+        env = self._env()
         try:
             proc = subprocess.run(
-                self.hermes_cmd + [prompt], capture_output=True, text=True,
+                cmd, input=stdin, capture_output=True, text=True,
                 env=env, timeout=900)  # 15-minute cap (long-running agent tasks)
             out = (proc.stdout or "").strip()
             if proc.returncode != 0:
